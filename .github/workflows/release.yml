@@ -50,10 +50,10 @@ jobs:
           echo "Updated csproj to version $version"
 
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore MonitorProfileSwitcher/MonitorProfileSwitcher.csproj
 
       - name: Build
-        run: dotnet build -c Release --no-restore
+        run: dotnet build MonitorProfileSwitcher/MonitorProfileSwitcher.csproj -c Release --no-restore
 
       - name: Publish
         run: |
