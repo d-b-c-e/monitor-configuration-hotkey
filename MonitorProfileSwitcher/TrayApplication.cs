@@ -10,6 +10,7 @@ internal class TrayApplication : ApplicationContext
     private readonly Dictionary<int, DisplayProfile> _hotkeyMap = new();
     private int _nextHotkeyId = 1;
     private HiddenHotkeyWindow? _hotkeyWindow;
+    private ReleaseInfo? _pendingUpdate;
 
     public TrayApplication()
     {
@@ -33,6 +34,12 @@ internal class TrayApplication : ApplicationContext
 
         _hotkeyWindow = new HiddenHotkeyWindow(OnHotkeyPressed);
         RegisterAllHotkeys();
+
+        // Check for updates on startup (fire-and-forget, rate-limited to once per 24h)
+        if (UpdateService.ShouldCheck())
+        {
+            _ = CheckForUpdateAsync(silent: true);
+        }
     }
 
     private void RebuildContextMenu()
@@ -101,6 +108,22 @@ internal class TrayApplication : ApplicationContext
             MessageBox.Show(desc, "Current Display Configuration",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
+
+        // Update
+        if (_pendingUpdate != null)
+        {
+            var updateItem = menu.Items.Add($"Update Available: v{_pendingUpdate.Version} ({_pendingUpdate.FormattedSize})");
+            updateItem.Font = new Font(updateItem.Font, FontStyle.Bold);
+            updateItem.Click += (_, _) => DownloadAndInstallUpdate(_pendingUpdate);
+        }
+        else
+        {
+            var checkItem = menu.Items.Add("Check for Updates");
+            checkItem.Click += (_, _) => _ = CheckForUpdateAsync(silent: false);
+        }
+
+        var versionItem = menu.Items.Add($"v{UpdateService.GetCurrentVersion()}");
+        versionItem.Enabled = false;
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -195,6 +218,46 @@ internal class TrayApplication : ApplicationContext
         if (_hotkeyMap.TryGetValue(hotkeyId, out var profile))
         {
             ApplyProfile(profile);
+        }
+    }
+
+    private async Task CheckForUpdateAsync(bool silent)
+    {
+        try
+        {
+            var release = await UpdateService.CheckForUpdateAsync();
+            if (release != null)
+            {
+                _pendingUpdate = release;
+                RebuildContextMenu();
+                ShowBalloon($"Update available: v{release.Version} — right-click tray icon to install");
+            }
+            else if (!silent)
+            {
+                ShowBalloon("You're running the latest version.");
+            }
+        }
+        catch
+        {
+            if (!silent)
+                ShowBalloon("Unable to check for updates.", ToolTipIcon.Warning);
+        }
+    }
+
+    private async void DownloadAndInstallUpdate(ReleaseInfo release)
+    {
+        ShowBalloon($"Downloading v{release.Version}...");
+
+        var path = await UpdateService.DownloadInstallerAsync(release);
+        if (path != null)
+        {
+            UnregisterAllHotkeys();
+            _trayIcon.Visible = false;
+            UpdateService.LaunchInstallerAndExit(path);
+        }
+        else
+        {
+            ShowBalloon("Download failed. Try again later.", ToolTipIcon.Error);
         }
     }
 

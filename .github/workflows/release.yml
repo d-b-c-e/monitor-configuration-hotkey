@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          echo "Version: $version"
+
+      - name: Update version in csproj
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $csprojPath = "MonitorProfileSwitcher/MonitorProfileSwitcher.csproj"
+
+          $content = Get-Content $csprojPath -Raw
+          $content = $content -replace '<Version>.*?</Version>', "<Version>$version</Version>"
+
+          # Update assembly version (strip pre-release suffix, ensure 4-part)
+          $assemblyVersion = $version -replace '-.*$', ''
+          if ($assemblyVersion -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            $assemblyVersion = "$assemblyVersion.0"
+          }
+          $content = $content -replace '<AssemblyVersion>.*?</AssemblyVersion>', "<AssemblyVersion>$assemblyVersion</AssemblyVersion>"
+          $content = $content -replace '<FileVersion>.*?</FileVersion>', "<FileVersion>$assemblyVersion</FileVersion>"
+
+          Set-Content $csprojPath $content
+          echo "Updated csproj to version $version"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Publish
+        run: |
+          dotnet publish MonitorProfileSwitcher/MonitorProfileSwitcher.csproj -c Release -o publish --self-contained false
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$version installer\MonitorProfileSwitcher.iss
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Monitor Profile Switcher v${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
+          body: |
+            ## Monitor Profile Switcher v${{ steps.version.outputs.VERSION }}
+
+            Download and run the installer below to install or update.
+
+            ### What's included
+            - System tray app for switching monitor profiles via hotkeys
+            - Global hotkey support (e.g., Ctrl+Alt+1 through 5)
+            - Auto-update checks (every 24 hours)
+            - Start with Windows via Scheduled Task (reliable with Fast Startup)
+          files: |
+            dist/MonitorProfileSwitcher-${{ steps.version.outputs.VERSION }}-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
