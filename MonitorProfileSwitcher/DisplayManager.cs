@@ -78,105 +78,180 @@ internal static class DisplayManager
 
     public static void ApplyProfile(DisplayProfile profile)
     {
-        // Query ALL paths (including inactive) to find monitors we need to activate
-        var (allPaths, allModes) = QueryConfig(
+        // Query ALL paths (including inactive)
+        var (allPaths, _) = QueryConfig(
             QueryDisplayConfigFlags.QDC_ALL_PATHS |
             QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
 
-        // Build a lookup of current monitors by device path
-        var currentMonitors = new Dictionary<string, (int pathIndex, DISPLAYCONFIG_TARGET_DEVICE_NAME name)>();
+        // Build set of wanted device paths
+        var wantedDevicePaths = new HashSet<string>(
+            profile.Monitors.Select(m => m.DevicePath),
+            StringComparer.OrdinalIgnoreCase);
+
+        // Build device path lookup for all paths
+        var pathDevicePaths = new string[allPaths.Length];
         for (int i = 0; i < allPaths.Length; i++)
         {
             var name = GetTargetDeviceName(allPaths[i].targetInfo.adapterId, allPaths[i].targetInfo.id);
-            if (!string.IsNullOrEmpty(name.monitorDevicePath))
+            pathDevicePaths[i] = name.monitorDevicePath ?? "";
+        }
+
+        // Strategy (following MartinGC94/DisplayConfig pattern):
+        // 1. For each wanted monitor, pick one path and mark it ACTIVE with a unique clone group
+        // 2. For all other paths, clear ACTIVE and invalidate modes
+        // 3. Pass ALL paths to SetDisplayConfig with SDC_TOPOLOGY_SUPPLIED
+
+        var matchedDevicePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usedSourceIds = new HashSet<uint>();
+        var activatedIndices = new HashSet<int>();
+        uint cloneGroup = 0;
+
+        // First pass: match wanted monitors to paths, preferring saved source IDs
+        var savedMonitors = profile.Monitors.ToDictionary(m => m.DevicePath, StringComparer.OrdinalIgnoreCase);
+        foreach (var pass in new[] { true, false }) // true=match saved sourceId, false=any
+        {
+            for (int i = 0; i < allPaths.Length; i++)
             {
-                currentMonitors.TryAdd(name.monitorDevicePath, (i, name));
+                var devicePath = pathDevicePaths[i];
+                if (string.IsNullOrEmpty(devicePath) || !wantedDevicePaths.Contains(devicePath))
+                    continue;
+                if (matchedDevicePaths.Contains(devicePath))
+                    continue;
+                if (usedSourceIds.Contains(allPaths[i].sourceInfo.id))
+                    continue;
+
+                if (pass && savedMonitors.TryGetValue(devicePath, out var saved) &&
+                    allPaths[i].sourceInfo.id != saved.SourceId)
+                    continue;
+
+                activatedIndices.Add(i);
+                matchedDevicePaths.Add(devicePath);
+                usedSourceIds.Add(allPaths[i].sourceInfo.id);
             }
         }
 
-        // Build new path and mode arrays from the saved profile
-        var newPaths = new List<DISPLAYCONFIG_PATH_INFO>();
-        var newModes = new List<DISPLAYCONFIG_MODE_INFO>();
-
-        foreach (var savedMonitor in profile.Monitors)
+        if (activatedIndices.Count == 0)
         {
-            if (!currentMonitors.TryGetValue(savedMonitor.DevicePath, out var current))
-                continue; // Monitor not currently connected, skip
+            throw new InvalidOperationException(
+                "No matching monitors found for this profile. Are the monitors connected?");
+        }
 
-            var path = allPaths[current.pathIndex];
-            path.flags = DISPLAYCONFIG_PATH_INFO.DISPLAYCONFIG_PATH_ACTIVE;
-            path.targetInfo.rotation = savedMonitor.Rotation;
-            path.targetInfo.scaling = savedMonitor.Scaling;
-            path.targetInfo.refreshRate = savedMonitor.RefreshRate;
+        // Build the final path array — ALL paths, with flags set appropriately
+        for (int i = 0; i < allPaths.Length; i++)
+        {
+            // Invalidate mode indices for all paths (Windows will supply modes)
+            // For virtual mode aware: upper 16 = 0xFFFF (invalid), lower 16 = clone group or 0xFFFF
+            allPaths[i].targetInfo.modeInfoIdx = 0xFFFFFFFF;
 
-            // Source mode
-            var sourceMode = new DISPLAYCONFIG_MODE_INFO
+            if (activatedIndices.Contains(i))
             {
-                infoType = DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
-                id = path.sourceInfo.id,
-                adapterId = path.sourceInfo.adapterId,
-                sourceMode = new DISPLAYCONFIG_SOURCE_MODE
-                {
-                    width = savedMonitor.Resolution.Width,
-                    height = savedMonitor.Resolution.Height,
-                    pixelFormat = DISPLAYCONFIG_PIXELFORMAT.PIXELFORMAT_32BPP,
-                    position = new POINTL { x = savedMonitor.Position.X, y = savedMonitor.Position.Y }
-                }
-            };
-
-            // Target mode — get from current all-paths config if available
-            DISPLAYCONFIG_MODE_INFO targetMode;
-            if (path.targetInfo.modeInfoIdx < allModes.Length &&
-                allModes[path.targetInfo.modeInfoIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
-            {
-                targetMode = allModes[path.targetInfo.modeInfoIdx];
-                targetMode.adapterId = path.targetInfo.adapterId;
-                targetMode.id = path.targetInfo.id;
+                allPaths[i].flags |= DISPLAYCONFIG_PATH_INFO.DISPLAYCONFIG_PATH_ACTIVE;
+                // Set source modeInfoIdx: upper 16 = 0xFFFF (invalid mode), lower 16 = clone group
+                allPaths[i].sourceInfo.modeInfoIdx = 0xFFFF0000 | cloneGroup;
+                cloneGroup++;
             }
             else
             {
-                targetMode = new DISPLAYCONFIG_MODE_INFO
-                {
-                    infoType = DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
-                    id = path.targetInfo.id,
-                    adapterId = path.targetInfo.adapterId,
-                };
+                allPaths[i].flags &= ~DISPLAYCONFIG_PATH_INFO.DISPLAYCONFIG_PATH_ACTIVE;
+                allPaths[i].sourceInfo.modeInfoIdx = 0xFFFFFFFF;
             }
-
-            path.sourceInfo.modeInfoIdx = (uint)newModes.Count;
-            newModes.Add(sourceMode);
-
-            path.targetInfo.modeInfoIdx = (uint)newModes.Count;
-            newModes.Add(targetMode);
-
-            newPaths.Add(path);
         }
 
-        if (newPaths.Count == 0)
-        {
-            throw new InvalidOperationException("No matching monitors found for this profile. Are the monitors connected?");
-        }
-
-        var pathArray = newPaths.ToArray();
-        var modeArray = newModes.ToArray();
-
-        // Apply with SDC_ALLOW_CHANGES to let Windows adjust modes if needed
-        var flags = SetDisplayConfigFlags.SDC_APPLY |
-                    SetDisplayConfigFlags.SDC_USE_SUPPLIED_DISPLAY_CONFIG |
-                    SetDisplayConfigFlags.SDC_ALLOW_CHANGES |
-                    SetDisplayConfigFlags.SDC_SAVE_TO_DATABASE |
-                    SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE;
-
+        // Apply with SDC_TOPOLOGY_SUPPLIED — pass ALL paths, no modes
         int result = DisplayConfigApi.SetDisplayConfig(
-            pathArray.Length, pathArray,
-            modeArray.Length, modeArray,
-            flags);
+            allPaths.Length, allPaths,
+            0, null,
+            SetDisplayConfigFlags.SDC_APPLY |
+            SetDisplayConfigFlags.SDC_TOPOLOGY_SUPPLIED |
+            SetDisplayConfigFlags.SDC_ALLOW_PATH_ORDER_CHANGES |
+            SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE);
 
         if (result != DisplayConfigApi.ERROR_SUCCESS)
         {
             throw new InvalidOperationException(
                 $"SetDisplayConfig failed with error code {result}. " +
-                $"Tried to activate {newPaths.Count} monitor(s).");
+                $"Tried to activate {activatedIndices.Count} monitor(s): " +
+                string.Join(", ", profile.Monitors.Select(m => m.FriendlyName)));
+        }
+
+        // Phase 2: Apply saved positions, primary, and resolution
+        // Now that the correct monitors are active, query the current config
+        // and adjust positions/primary to match the saved profile
+        ApplyLayout(profile);
+    }
+
+    private static void ApplyLayout(DisplayProfile profile)
+    {
+        var (paths, modes) = QueryConfig(
+            QueryDisplayConfigFlags.QDC_ONLY_ACTIVE_PATHS |
+            QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
+
+        // Build saved monitor lookup by device path
+        var savedByPath = profile.Monitors.ToDictionary(
+            m => m.DevicePath, StringComparer.OrdinalIgnoreCase);
+
+        // Match current paths to saved monitors and update source modes
+        bool changed = false;
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var name = GetTargetDeviceName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id);
+            if (!savedByPath.TryGetValue(name.monitorDevicePath ?? "", out var saved))
+                continue;
+
+            // Find the source mode for this path
+            uint sourceModeIdx = paths[i].sourceInfo.modeInfoIdx >> 16;
+            if (sourceModeIdx >= modes.Length ||
+                modes[sourceModeIdx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                // Fallback: scan for matching source mode
+                for (uint mi = 0; mi < modes.Length; mi++)
+                {
+                    if (modes[mi].infoType == DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+                        modes[mi].id == paths[i].sourceInfo.id &&
+                        modes[mi].adapterId.LowPart == paths[i].sourceInfo.adapterId.LowPart)
+                    {
+                        sourceModeIdx = mi;
+                        break;
+                    }
+                }
+            }
+
+            if (sourceModeIdx < modes.Length &&
+                modes[sourceModeIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                var mode = modes[sourceModeIdx];
+                if (mode.sourceMode.position.x != saved.Position.X ||
+                    mode.sourceMode.position.y != saved.Position.Y ||
+                    mode.sourceMode.width != saved.Resolution.Width ||
+                    mode.sourceMode.height != saved.Resolution.Height)
+                {
+                    mode.sourceMode.position.x = saved.Position.X;
+                    mode.sourceMode.position.y = saved.Position.Y;
+                    mode.sourceMode.width = saved.Resolution.Width;
+                    mode.sourceMode.height = saved.Resolution.Height;
+                    modes[sourceModeIdx] = mode;
+                    changed = true;
+                }
+            }
+        }
+
+        if (!changed)
+            return;
+
+        // Apply the adjusted layout
+        int result = DisplayConfigApi.SetDisplayConfig(
+            paths.Length, paths,
+            modes.Length, modes,
+            SetDisplayConfigFlags.SDC_APPLY |
+            SetDisplayConfigFlags.SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+            SetDisplayConfigFlags.SDC_ALLOW_CHANGES |
+            SetDisplayConfigFlags.SDC_SAVE_TO_DATABASE |
+            SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE);
+
+        // Non-fatal if layout apply fails — topology is already correct
+        if (result != DisplayConfigApi.ERROR_SUCCESS)
+        {
+            Console.Error.WriteLine($"Warning: Layout adjustment returned {result} — topology is correct but positions may differ");
         }
     }
 

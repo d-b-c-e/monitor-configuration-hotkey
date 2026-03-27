@@ -24,6 +24,12 @@ static class Program
             return;
         }
 
+        if (args.Length == 1 && args[0] == "--all-paths")
+        {
+            DebugDump.DumpAllPaths();
+            return;
+        }
+
         if (args.Length == 1 && args[0] == "--debug")
         {
             DebugDump.DumpConfig();

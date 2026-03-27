@@ -4,6 +4,49 @@ namespace MonitorProfileSwitcher;
 
 internal static class DebugDump
 {
+    public static void DumpAllPaths()
+    {
+        int result = DisplayConfigApi.GetDisplayConfigBufferSizes(
+            QueryDisplayConfigFlags.QDC_ALL_PATHS | QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE,
+            out int pathCount, out int modeCount);
+        Console.WriteLine($"QDC_ALL_PATHS: result={result}, paths={pathCount}, modes={modeCount}");
+
+        var paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
+        var modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
+        result = DisplayConfigApi.QueryDisplayConfig(
+            QueryDisplayConfigFlags.QDC_ALL_PATHS | QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE,
+            ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+        Console.WriteLine($"QueryDisplayConfig: result={result}");
+
+        // Group by target device path
+        var seen = new HashSet<string>();
+        for (int i = 0; i < pathCount; i++)
+        {
+            var p = paths[i];
+            var name = GetTargetName(p.targetInfo.adapterId, p.targetInfo.id);
+            bool active = (p.flags & 1) != 0;
+            string key = $"{name.monitorDevicePath}|src{p.sourceInfo.id}";
+
+            if (!seen.Add(key) && !active) continue; // Skip duplicate inactive entries
+
+            Console.WriteLine($"  [{i}] {(active ? "ACTIVE" : "      ")} " +
+                $"src={p.sourceInfo.id} tgt={p.targetInfo.id} " +
+                $"flags=0x{p.flags:X} " +
+                $"monitor={name.monitorFriendlyDeviceName}");
+        }
+    }
+
+    private static DISPLAYCONFIG_TARGET_DEVICE_NAME GetTargetName(LUID adapterId, uint targetId)
+    {
+        var name = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
+        name.header.type = DISPLAYCONFIG_DEVICE_INFO_TYPE.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        name.header.size = System.Runtime.InteropServices.Marshal.SizeOf<DISPLAYCONFIG_TARGET_DEVICE_NAME>();
+        name.header.adapterId = adapterId;
+        name.header.id = targetId;
+        DisplayConfigApi.DisplayConfigGetDeviceInfo(ref name);
+        return name;
+    }
+
     public static void DumpConfig()
     {
         int result = DisplayConfigApi.GetDisplayConfigBufferSizes(
