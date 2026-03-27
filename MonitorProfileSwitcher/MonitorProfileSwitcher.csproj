@@ -9,6 +9,11 @@
 
     <AssemblyName>MonitorProfileSwitcher</AssemblyName>
     <RootNamespace>MonitorProfileSwitcher</RootNamespace>
+    <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icon.png" />
+  </ItemGroup>
 
 </Project>

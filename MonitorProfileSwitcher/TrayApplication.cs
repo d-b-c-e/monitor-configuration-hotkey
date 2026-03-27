@@ -1,3 +1,4 @@
+using System.Reflection;
 using MonitorProfileSwitcher.Native;
 
 namespace MonitorProfileSwitcher;
@@ -17,7 +18,7 @@ internal class TrayApplication : ApplicationContext
 
         _trayIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = LoadEmbeddedIcon(),
             Text = "Monitor Profile Switcher",
             Visible = true,
         };
@@ -203,6 +204,19 @@ internal class TrayApplication : ApplicationContext
         _trayIcon.BalloonTipText = text;
         _trayIcon.BalloonTipIcon = icon;
         _trayIcon.ShowBalloonTip(3000);
+    }
+
+    private static Icon LoadEmbeddedIcon()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var stream = assembly.GetManifestResourceStream("MonitorProfileSwitcher.icon.png");
+        if (stream != null)
+        {
+            using var bmp = new Bitmap(stream);
+            var resized = new Bitmap(bmp, 32, 32);
+            return Icon.FromHandle(resized.GetHicon());
+        }
+        return SystemIcons.Application;
     }
 }
 
