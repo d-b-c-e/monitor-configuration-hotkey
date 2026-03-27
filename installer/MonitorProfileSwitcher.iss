@@ -41,7 +41,7 @@ RestartApplications=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "startwithwindows"; Description: "Start with Windows (recommended)"; GroupDescription: "System Integration:"; Flags: checked
+Name: "startwithwindows"; Description: "Start with Windows (recommended)"; GroupDescription: "System Integration:"
 
 [Files]
 ; Main application files from publish directory
