@@ -11,6 +11,9 @@ internal class TrayApplication : ApplicationContext
     private int _nextHotkeyId = 1;
     private HiddenHotkeyWindow? _hotkeyWindow;
     private ReleaseInfo? _pendingUpdate;
+    private FileSystemWatcher? _profileWatcher;
+    private Control? _uiMarshal;
+    private System.Windows.Forms.Timer? _reloadTimer;
 
     public TrayApplication()
     {
@@ -34,6 +37,8 @@ internal class TrayApplication : ApplicationContext
 
         _hotkeyWindow = new HiddenHotkeyWindow(OnHotkeyPressed);
         RegisterAllHotkeys();
+
+        SetupProfileWatcher();
 
         // Check for updates on startup (fire-and-forget, rate-limited to once per 24h)
         if (UpdateService.ShouldCheck())
@@ -132,6 +137,7 @@ internal class TrayApplication : ApplicationContext
         exitItem.Click += (_, _) =>
         {
             UnregisterAllHotkeys();
+            _profileWatcher?.Dispose();
             _trayIcon.Visible = false;
             Application.Exit();
         };
@@ -173,12 +179,76 @@ internal class TrayApplication : ApplicationContext
     {
         try
         {
-            DisplayManager.ApplyProfile(profile);
-            ShowBalloon($"Switched to '{profile.Name}'");
+            // Re-read profiles.json from disk first: this instance loaded profiles at
+            // startup, and the file may have changed since (manual edit, restore from
+            // backup, sync). Re-fetch by name so we apply the current saved monitors.
+            _profileManager.Reload();
+            var fresh = _profileManager.GetProfile(profile.Name) ?? profile;
+            DisplayManager.ApplyProfile(fresh);
+            ShowBalloon($"Switched to '{fresh.Name}'");
         }
         catch (Exception ex)
         {
             ShowBalloon($"Failed: {ex.Message}", ToolTipIcon.Error);
+        }
+    }
+
+    /// <summary>Watch profiles.json for external changes (manual edit, restore, sync) and
+    /// reload + re-register hotkeys + rebuild the menu so the live app never runs on stale
+    /// data. Failure here is non-fatal — watching is a convenience.</summary>
+    private void SetupProfileWatcher()
+    {
+        try
+        {
+            // Hidden control whose handle is created on the UI thread; FileSystemWatcher
+            // marshals its events onto this thread so the reload is UI-thread-safe.
+            _uiMarshal = new Control();
+            _ = _uiMarshal.Handle;
+
+            _reloadTimer = new System.Windows.Forms.Timer { Interval = 300 };
+            _reloadTimer.Tick += (_, _) =>
+            {
+                _reloadTimer!.Stop();
+                ReloadProfilesFromDisk();
+            };
+
+            Directory.CreateDirectory(ProfileManager.StorageDir);
+            _profileWatcher = new FileSystemWatcher(ProfileManager.StorageDir, ProfileManager.StorageFileName)
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName,
+                SynchronizingObject = _uiMarshal,
+            };
+            FileSystemEventHandler onChange = (_, _) => DebouncedReload();
+            _profileWatcher.Changed += onChange;
+            _profileWatcher.Created += onChange;
+            _profileWatcher.Renamed += (_, _) => DebouncedReload();
+            _profileWatcher.EnableRaisingEvents = true;
+        }
+        catch
+        {
+            // ignore — the reload-before-apply path still keeps applies correct.
+        }
+    }
+
+    // Coalesce the burst of events a single save produces into one reload after things settle.
+    private void DebouncedReload()
+    {
+        _reloadTimer?.Stop();
+        _reloadTimer?.Start();
+    }
+
+    private void ReloadProfilesFromDisk()
+    {
+        try
+        {
+            _profileManager.Reload();
+            UnregisterAllHotkeys();
+            RegisterAllHotkeys();
+            RebuildContextMenu();
+        }
+        catch
+        {
+            // Transient read error (file mid-write); the next event will retry.
         }
     }
 

@@ -88,12 +88,17 @@ internal static class DisplayManager
             profile.Monitors.Select(m => m.DevicePath),
             StringComparer.OrdinalIgnoreCase);
 
-        // Build device path lookup for all paths
+        // Build device path lookup for all paths, and collect the friendly names of every
+        // currently-connected monitor (for a useful error if nothing matches).
         var pathDevicePaths = new string[allPaths.Length];
+        var connectedNames = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < allPaths.Length; i++)
         {
             var name = GetTargetDeviceName(allPaths[i].targetInfo.adapterId, allPaths[i].targetInfo.id);
             pathDevicePaths[i] = name.monitorDevicePath ?? "";
+            if (!string.IsNullOrEmpty(pathDevicePaths[i]) &&
+                !string.IsNullOrWhiteSpace(name.monitorFriendlyDeviceName))
+                connectedNames.Add(name.monitorFriendlyDeviceName);
         }
 
         // Strategy (following MartinGC94/DisplayConfig pattern):
@@ -132,8 +137,14 @@ internal static class DisplayManager
 
         if (activatedIndices.Count == 0)
         {
+            var wanted = string.Join(", ", profile.Monitors.Select(m => m.FriendlyName));
+            var connected = connectedNames.Count > 0
+                ? string.Join(", ", connectedNames)
+                : "(none detected)";
             throw new InvalidOperationException(
-                "No matching monitors found for this profile. Are the monitors connected?");
+                $"None of '{profile.Name}'s monitors are connected. " +
+                $"Wanted: {wanted}. Currently connected: {connected}. " +
+                "Power those displays on; if you edited profiles.json outside the app, restart it.");
         }
 
         // Build the final path array — ALL paths, with flags set appropriately

@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace MonitorProfileSwitcher;
 
 static class Program
@@ -42,7 +44,13 @@ static class Program
             return;
         }
 
-        // GUI tray mode (default)
+        // GUI tray mode (default) — enforce a single tray instance so two copies don't
+        // fight over global hotkeys or diverge on in-memory profile state.
+        using var singleInstance = new Mutex(
+            initiallyOwned: true, @"Local\MonitorProfileSwitcher_SingleInstance", out bool createdNew);
+        if (!createdNew)
+            return; // another tray instance is already running
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApplication());

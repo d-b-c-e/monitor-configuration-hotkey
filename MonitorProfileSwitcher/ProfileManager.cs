@@ -10,6 +10,12 @@ internal class ProfileManager
 
     private static readonly string ProfilePath = Path.Combine(ProfileDir, "profiles.json");
 
+    /// <summary>Directory containing profiles.json (for an external-change watcher).</summary>
+    public static string StorageDir => ProfileDir;
+
+    /// <summary>The profiles.json filename (no path).</summary>
+    public static string StorageFileName => "profiles.json";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -31,6 +37,10 @@ internal class ProfileManager
         var json = File.ReadAllText(ProfilePath);
         _store = JsonSerializer.Deserialize<ProfileStore>(json, JsonOptions) ?? new ProfileStore();
     }
+
+    /// <summary>Re-read profiles.json from disk, discarding the in-memory copy. Use when the
+    /// file may have changed outside the app (manual edit, restore from backup, sync).</summary>
+    public void Reload() => Load();
 
     public void Save()
     {
