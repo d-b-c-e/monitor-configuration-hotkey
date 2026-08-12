@@ -37,6 +37,11 @@ internal static class DisplayConfigApi
 
     public const int ERROR_SUCCESS = 0;
     public const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+    /// <summary>Marks a path's mode index as "none supplied", telling Windows to work the
+    /// mode out itself. Used when changing refresh rate: the previously chosen target mode
+    /// carries the old timings, so it has to be dropped for the new rate to take effect.</summary>
+    public const uint DISPLAYCONFIG_PATH_MODE_IDX_INVALID = 0xFFFFFFFF;
 }
 
 [Flags]

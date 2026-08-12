@@ -31,7 +31,41 @@ internal class MonitorInfo
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public DISPLAYCONFIG_SCALING Scaling { get; set; } = DISPLAYCONFIG_SCALING.IDENTITY;
 
-    public DISPLAYCONFIG_RATIONAL RefreshRate { get; set; }
+    public MonitorRefreshRate RefreshRate { get; set; } = new();
+}
+
+/// <summary>
+/// Refresh rate as the exact rational the CCD API works in (e.g. 143999/1000), not a
+/// rounded Hz figure — Windows matches target modes on the exact numerator/denominator.
+///
+/// Deliberately a plain model class rather than the interop DISPLAYCONFIG_RATIONAL
+/// struct this used to be: that struct exposes Numerator/Denominator as FIELDS, and
+/// System.Text.Json serializes properties only. So every profile persisted
+/// "refreshRate": {} and the captured rate was silently lost on save.
+/// </summary>
+internal class MonitorRefreshRate
+{
+    public uint Numerator { get; set; }
+    public uint Denominator { get; set; }
+
+    /// <summary>False for profiles written before the rate was persisted correctly — they
+    /// load back as 0/0. Those are left for Windows to choose rather than being applied
+    /// as a nonsense 0 Hz.</summary>
+    [JsonIgnore]
+    public bool IsSpecified => Numerator != 0 && Denominator != 0;
+
+    public double ToHz() => Denominator == 0 ? 0 : (double)Numerator / Denominator;
+
+    public override string ToString() => IsSpecified ? $"{ToHz():F2}Hz" : "(unset)";
+
+    public bool Matches(DISPLAYCONFIG_RATIONAL other) =>
+        Numerator == other.Numerator && Denominator == other.Denominator;
+
+    public static MonitorRefreshRate From(DISPLAYCONFIG_RATIONAL r) =>
+        new() { Numerator = r.Numerator, Denominator = r.Denominator };
+
+    public DISPLAYCONFIG_RATIONAL ToRational() =>
+        new() { Numerator = Numerator, Denominator = Denominator };
 }
 
 internal class MonitorPosition

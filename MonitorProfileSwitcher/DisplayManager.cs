@@ -57,7 +57,7 @@ internal static class DisplayManager
                 OutputTechnology = targetName.outputTechnology,
                 Rotation = path.targetInfo.rotation,
                 Scaling = path.targetInfo.scaling,
-                RefreshRate = path.targetInfo.refreshRate,
+                RefreshRate = MonitorRefreshRate.From(path.targetInfo.refreshRate),
                 IsPrimary = sourceMode?.position.x == 0 && sourceMode?.position.y == 0,
                 Position = sourceMode.HasValue
                     ? new MonitorPosition { X = sourceMode.Value.position.x, Y = sourceMode.Value.position.y }
@@ -197,12 +197,19 @@ internal static class DisplayManager
             QueryDisplayConfigFlags.QDC_ONLY_ACTIVE_PATHS |
             QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
 
+        // Pristine copy of the paths, so a refresh rate the display refuses can be retried
+        // as a geometry-only apply instead of losing the position/resolution fix with it.
+        // Geometry edits land in `modes` and rate edits land in `paths`, so the two are
+        // cleanly separable. Both arrays hold structs, so Clone() is a real copy.
+        var pathsWithoutRate = (DISPLAYCONFIG_PATH_INFO[])paths.Clone();
+
         // Build saved monitor lookup by device path
         var savedByPath = profile.Monitors.ToDictionary(
             m => m.DevicePath, StringComparer.OrdinalIgnoreCase);
 
         // Match current paths to saved monitors and update source modes
         bool changed = false;
+        bool rateChanged = false;
         for (int i = 0; i < paths.Length; i++)
         {
             var name = GetTargetDeviceName(paths[i].targetInfo.adapterId, paths[i].targetInfo.id);
@@ -244,13 +251,53 @@ internal static class DisplayManager
                     changed = true;
                 }
             }
+
+            // Refresh rate hangs off the TARGET side of the path — it is not part of the
+            // source mode. Restoring only the source mode (all this used to do) brought
+            // back resolution and position but left Windows free to pick the rate, which
+            // is how a profile captured at 60Hz came back at 144Hz.
+            if (saved.RefreshRate.IsSpecified && !saved.RefreshRate.Matches(paths[i].targetInfo.refreshRate))
+            {
+                paths[i].targetInfo.refreshRate = saved.RefreshRate.ToRational();
+                // The target mode Windows already chose encodes the OLD timings, so drop
+                // it and let the new rate drive mode selection.
+                paths[i].targetInfo.modeInfoIdx = DisplayConfigApi.DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                changed = true;
+                rateChanged = true;
+            }
         }
 
         if (!changed)
             return;
 
         // Apply the adjusted layout
-        int result = DisplayConfigApi.SetDisplayConfig(
+        int result = ApplySuppliedConfig(paths, modes);
+        if (result == DisplayConfigApi.ERROR_SUCCESS)
+            return;
+
+        if (rateChanged)
+        {
+            // The rate was refused — the monitor may be on a different port than when the
+            // profile was captured, or behind a cable/EDID that cannot carry it. Retry
+            // without it so resolution and position still land.
+            int retry = ApplySuppliedConfig(pathsWithoutRate, modes);
+            if (retry == DisplayConfigApi.ERROR_SUCCESS)
+            {
+                Console.Error.WriteLine(
+                    $"Warning: '{profile.Name}' refresh rate was rejected (error {result}) — " +
+                    "resolution and position were restored, rate left as Windows chose it");
+                return;
+            }
+            result = retry;
+        }
+
+        // Non-fatal if layout apply fails — topology is already correct
+        Console.Error.WriteLine($"Warning: Layout adjustment returned {result} — topology is correct but positions may differ");
+    }
+
+    private static int ApplySuppliedConfig(
+        DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) =>
+        DisplayConfigApi.SetDisplayConfig(
             paths.Length, paths,
             modes.Length, modes,
             SetDisplayConfigFlags.SDC_APPLY |
@@ -258,13 +305,6 @@ internal static class DisplayManager
             SetDisplayConfigFlags.SDC_ALLOW_CHANGES |
             SetDisplayConfigFlags.SDC_SAVE_TO_DATABASE |
             SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE);
-
-        // Non-fatal if layout apply fails — topology is already correct
-        if (result != DisplayConfigApi.ERROR_SUCCESS)
-        {
-            Console.Error.WriteLine($"Warning: Layout adjustment returned {result} — topology is correct but positions may differ");
-        }
-    }
 
     public static string DescribeCurrentConfig()
     {

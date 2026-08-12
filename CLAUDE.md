@@ -42,6 +42,39 @@ MonitorProfileSwitcher --list               # list saved profiles
 - `adapterId` (LUID) changes every reboot — match monitors by `monitorDevicePath` instead
 - To disable a monitor: exclude its path from the array passed to `SetDisplayConfig`
 - Must use `SDC_ALLOW_CHANGES | SDC_VIRTUAL_MODE_AWARE` flags
+- **Refresh rate lives on the TARGET side of the path (`targetInfo.refreshRate`), not in
+  the source mode.** Position and resolution are source-mode fields; setting only those
+  restores geometry and lets Windows pick whatever rate it likes. To actually set a rate:
+  assign `targetInfo.refreshRate` AND set `targetInfo.modeInfoIdx =
+  DISPLAYCONFIG_PATH_MODE_IDX_INVALID` (the already-chosen target mode still encodes the
+  old timings, so it has to be dropped) — then apply with `SDC_USE_SUPPLIED_DISPLAY_CONFIG`.
+- **Interop structs must not be persisted directly.** `DISPLAYCONFIG_RATIONAL` exposes
+  `Numerator`/`Denominator` as *fields*, and `System.Text.Json` serializes properties only,
+  so storing it wrote `"refreshRate": {}` and silently lost every captured rate. Persisted
+  models are plain classes with properties (`MonitorRefreshRate`); interop types stay in
+  `Native/`. Profiles written before this load back as 0/0 and are treated as "unspecified"
+  — geometry is restored, rate is left to Windows.
+- **Testing a rate change needs a PERSISTED starting state.** `ChangeDisplaySettingsEx`
+  with flags 0 changes the rate for the session only; the CCD topology pass re-reads the
+  saved display database and reverts it, so any build appears to "restore" the rate. Use
+  `CDS_UPDATEREGISTRY` to set up the test or the result is meaningless.
+
+## Tray icon lifetime
+
+The icon can be lost in two ways, both of which leave the process running and hotkeys
+working (`RegisterHotKey` is independent of the shell) — so the only symptom is a missing
+icon, which reads to the user as "it didn't start":
+
+1. **Logon race.** A logon scheduled task can start the app fractionally *before* Explorer.
+   With no taskbar, `Shell_NotifyIcon(NIM_ADD)` has nothing to talk to and the icon is
+   dropped. Handled by `GuardAgainstMissingTrayIcon()`: if no `Shell_TrayWnd` exists at
+   startup, poll for it and re-add once it appears. No timer is created on the normal path.
+2. **Explorer restart.** Handled by listening for the `TaskbarCreated` broadcast in
+   `HiddenHotkeyWindow`. That window is deliberately a normal invisible top-level window,
+   **not** message-only — `HWND_BROADCAST` does not reach message-only windows.
+
+Re-adding is `Visible = false` then `true` (NIM_DELETE + NIM_ADD). Only do it when the icon
+is believed missing: toggling a healthy icon sends it to the back of the tray order.
 
 ## Status
 

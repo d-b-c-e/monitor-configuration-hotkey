@@ -14,6 +14,7 @@ internal class TrayApplication : ApplicationContext
     private FileSystemWatcher? _profileWatcher;
     private Control? _uiMarshal;
     private System.Windows.Forms.Timer? _reloadTimer;
+    private System.Windows.Forms.Timer? _taskbarPoll;
 
     public TrayApplication()
     {
@@ -35,10 +36,11 @@ internal class TrayApplication : ApplicationContext
 
         RebuildContextMenu();
 
-        _hotkeyWindow = new HiddenHotkeyWindow(OnHotkeyPressed);
+        _hotkeyWindow = new HiddenHotkeyWindow(OnHotkeyPressed, ReassertTrayIcon);
         RegisterAllHotkeys();
 
         SetupProfileWatcher();
+        GuardAgainstMissingTrayIcon();
 
         // Check for updates on startup (fire-and-forget, rate-limited to once per 24h)
         if (UpdateService.ShouldCheck())
@@ -138,6 +140,7 @@ internal class TrayApplication : ApplicationContext
         {
             UnregisterAllHotkeys();
             _profileWatcher?.Dispose();
+            StopTaskbarPoll();
             _trayIcon.Visible = false;
             Application.Exit();
         };
@@ -190,6 +193,77 @@ internal class TrayApplication : ApplicationContext
         catch (Exception ex)
         {
             ShowBalloon($"Failed: {ex.Message}", ToolTipIcon.Error);
+        }
+    }
+
+    /// <summary>
+    /// Recover the tray icon when the shell was not ready to accept it.
+    ///
+    /// A logon scheduled task can start this app fractionally BEFORE Explorer. Tray icons
+    /// are hosted by the taskbar, so with no taskbar yet Shell_NotifyIcon(NIM_ADD) has
+    /// nothing to talk to and the icon is silently dropped. The app then runs on
+    /// invisibly — hotkeys still work, since RegisterHotKey has nothing to do with the
+    /// shell — so the only symptom is a missing icon, which reads as "it didn't start".
+    ///
+    /// Explorer broadcasts "TaskbarCreated" when it builds a taskbar, and WinForms'
+    /// NotifyIcon re-adds itself on that (we listen too, via HiddenHotkeyWindow, which
+    /// covers Explorer crashes/restarts). But that only rescues us if a broadcast
+    /// actually arrives after the failed add. When the taskbar simply is not up yet we
+    /// already know the add could not have landed, so wait for the shell and re-add
+    /// explicitly rather than trusting a broadcast to arrive.
+    ///
+    /// Costs nothing on the normal path: if a taskbar exists at startup the icon
+    /// registered fine and no timer is ever created.
+    /// </summary>
+    private void GuardAgainstMissingTrayIcon()
+    {
+        if (ShellApi.TaskbarExists())
+            return;
+
+        var waited = TimeSpan.Zero;
+        var timeout = TimeSpan.FromMinutes(5);
+
+        _taskbarPoll = new System.Windows.Forms.Timer { Interval = 1000 };
+        _taskbarPoll.Tick += (_, _) =>
+        {
+            waited += TimeSpan.FromMilliseconds(_taskbarPoll!.Interval);
+
+            if (ShellApi.TaskbarExists())
+            {
+                StopTaskbarPoll();
+                ReassertTrayIcon();
+            }
+            else if (waited >= timeout)
+            {
+                // No shell after five minutes means something far stranger than a logon
+                // race is going on; stop burning a timer on it.
+                StopTaskbarPoll();
+            }
+        };
+        _taskbarPoll.Start();
+    }
+
+    private void StopTaskbarPoll()
+    {
+        _taskbarPoll?.Stop();
+        _taskbarPoll?.Dispose();
+        _taskbarPoll = null;
+    }
+
+    /// <summary>Force a NIM_DELETE + NIM_ADD so the icon re-registers with whatever taskbar
+    /// is live now. Only called when there is reason to believe the icon is missing —
+    /// toggling a healthy one would send it to the back of the tray order.</summary>
+    private void ReassertTrayIcon()
+    {
+        try
+        {
+            _trayIcon.Visible = false;
+            _trayIcon.Visible = true;
+        }
+        catch
+        {
+            // Nothing useful to do, and not worth taking the app down over — the hotkeys
+            // keep working with or without an icon.
         }
     }
 
@@ -356,10 +430,20 @@ internal class TrayApplication : ApplicationContext
 internal class HiddenHotkeyWindow : NativeWindow
 {
     private readonly Action<int> _onHotkey;
+    private readonly Action _onTaskbarCreated;
+    private readonly uint _taskbarCreatedMsg;
 
-    public HiddenHotkeyWindow(Action<int> onHotkey)
+    public HiddenHotkeyWindow(Action<int> onHotkey, Action onTaskbarCreated)
     {
         _onHotkey = onHotkey;
+        _onTaskbarCreated = onTaskbarCreated;
+
+        // Resolve before the handle exists so WndProc can always compare against it.
+        _taskbarCreatedMsg = ShellApi.RegisterWindowMessage("TaskbarCreated");
+
+        // Deliberately a normal (if invisible) top-level window rather than a
+        // message-only one: "TaskbarCreated" is sent to HWND_BROADCAST, which does not
+        // reach message-only windows.
         CreateHandle(new CreateParams
         {
             Caption = "MonitorProfileSwitcher_HotkeyWindow",
@@ -372,6 +456,11 @@ internal class HiddenHotkeyWindow : NativeWindow
         if (m.Msg == HotkeyApi.WM_HOTKEY)
         {
             _onHotkey(m.WParam.ToInt32());
+        }
+        else if (_taskbarCreatedMsg != 0 && m.Msg == (int)_taskbarCreatedMsg)
+        {
+            // Explorer built a new taskbar — every tray icon it was hosting is gone.
+            _onTaskbarCreated();
         }
         base.WndProc(ref m);
     }
