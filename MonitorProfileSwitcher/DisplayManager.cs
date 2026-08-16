@@ -198,10 +198,14 @@ internal static class DisplayManager
             QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
 
         // Pristine copy of the paths, so a refresh rate the display refuses can be retried
-        // as a geometry-only apply instead of losing the position/resolution fix with it.
-        // Geometry edits land in `modes` and rate edits land in `paths`, so the two are
+        // WITHOUT the rate but WITH everything else, instead of losing the whole apply.
+        // Geometry edits land in `modes` and target edits land in `paths`, so the two are
         // cleanly separable. Both arrays hold structs, so Clone() is a real copy.
-        var pathsWithoutRate = (DISPLAYCONFIG_PATH_INFO[])paths.Clone();
+        var pristinePaths = (DISPLAYCONFIG_PATH_INFO[])paths.Clone();
+
+        // Rotation edits are replayed onto the pristine copy if the rate has to be dropped —
+        // otherwise a rejected refresh rate would silently take the rotation down with it.
+        var rotationEdits = new List<(int Index, DISPLAYCONFIG_ROTATION Rotation)>();
 
         // Build saved monitor lookup by device path
         var savedByPath = profile.Monitors.ToDictionary(
@@ -252,6 +256,24 @@ internal static class DisplayManager
                 }
             }
 
+            // Rotation ALSO lives on the target side, and was likewise captured, displayed
+            // in the UI, and then never applied. The failure is invisible in the common
+            // case, but lethal for a profile that differs from its twin ONLY by rotation
+            // (portrait vs landscape on the same monitor at the same resolution): the
+            // apply silently becomes a no-op. That is exactly what "it tries to switch but
+            // nothing happens" looks like.
+            //
+            // NOTE: CCD keeps the source mode UNROTATED — a 90-rotated 4K panel reports a
+            // 3840x2160 source with ROTATE90, even though the desktop measures 2160x3840.
+            // So the saved resolution and rotation are already consistent; they just both
+            // have to be applied.
+            if (IsValidRotation(saved.Rotation) && paths[i].targetInfo.rotation != saved.Rotation)
+            {
+                paths[i].targetInfo.rotation = saved.Rotation;
+                rotationEdits.Add((i, saved.Rotation));
+                changed = true;
+            }
+
             // Refresh rate hangs off the TARGET side of the path — it is not part of the
             // source mode. Restoring only the source mode (all this used to do) brought
             // back resolution and position but left Windows free to pick the rate, which
@@ -279,13 +301,16 @@ internal static class DisplayManager
         {
             // The rate was refused — the monitor may be on a different port than when the
             // profile was captured, or behind a cable/EDID that cannot carry it. Retry
-            // without it so resolution and position still land.
-            int retry = ApplySuppliedConfig(pathsWithoutRate, modes);
+            // without it, but KEEP the rotation, so the rest of the profile still lands.
+            foreach (var (index, rotation) in rotationEdits)
+                pristinePaths[index].targetInfo.rotation = rotation;
+
+            int retry = ApplySuppliedConfig(pristinePaths, modes);
             if (retry == DisplayConfigApi.ERROR_SUCCESS)
             {
                 Console.Error.WriteLine(
                     $"Warning: '{profile.Name}' refresh rate was rejected (error {result}) — " +
-                    "resolution and position were restored, rate left as Windows chose it");
+                    "resolution, position and rotation were restored, rate left as Windows chose it");
                 return;
             }
             result = retry;
@@ -294,6 +319,12 @@ internal static class DisplayManager
         // Non-fatal if layout apply fails — topology is already correct
         Console.Error.WriteLine($"Warning: Layout adjustment returned {result} — topology is correct but positions may differ");
     }
+
+    /// <summary>Guards against a profile written before rotation was persisted, or edited by
+    /// hand — the enum is 1-4, so a 0 would be rejected by SetDisplayConfig and take the
+    /// whole apply down with it.</summary>
+    private static bool IsValidRotation(DISPLAYCONFIG_ROTATION r) =>
+        r >= DISPLAYCONFIG_ROTATION.IDENTITY && r <= DISPLAYCONFIG_ROTATION.ROTATE270;
 
     private static int ApplySuppliedConfig(
         DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) =>

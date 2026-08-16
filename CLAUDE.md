@@ -48,6 +48,15 @@ MonitorProfileSwitcher --list               # list saved profiles
   assign `targetInfo.refreshRate` AND set `targetInfo.modeInfoIdx =
   DISPLAYCONFIG_PATH_MODE_IDX_INVALID` (the already-chosen target mode still encodes the
   old timings, so it has to be dropped) — then apply with `SDC_USE_SUPPLIED_DISPLAY_CONFIG`.
+- **Rotation lives on the target side too (`targetInfo.rotation`)** and must be applied
+  explicitly, exactly like refresh rate. It was captured and shown in the UI but never
+  applied — invisible in most profiles, but it makes a profile that differs from its twin
+  ONLY by rotation (portrait vs landscape, same monitor, same resolution) apply as a silent
+  no-op that still reports success.
+- **CCD keeps the source mode UNROTATED.** A 90°-rotated 4K panel reports a `3840x2160`
+  source with `ROTATE90`, even though the desktop measures `2160x3840`
+  (`Screen.AllScreens`). So saved resolution and rotation are already consistent — do NOT
+  swap width/height when applying; just apply both fields.
 - **Interop structs must not be persisted directly.** `DISPLAYCONFIG_RATIONAL` exposes
   `Numerator`/`Denominator` as *fields*, and `System.Text.Json` serializes properties only,
   so storing it wrote `"refreshRate": {}` and silently lost every captured rate. Persisted
