@@ -4,8 +4,14 @@ namespace MonitorProfileSwitcher.Native;
 
 internal static class HotkeyApi
 {
-    [DllImport("user32.dll")]
+    /// <remarks><c>SetLastError</c> matters here: a failed registration is silent otherwise, and
+    /// the error code is the only way to tell "another app owns this combination" apart from a
+    /// transient failure worth retrying.</remarks>
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    /// <summary>Another process already owns the combination. Retrying will not help unless it exits.</summary>
+    public const int ERROR_HOTKEY_ALREADY_REGISTERED = 1409;
 
     [DllImport("user32.dll")]
     public static extern bool UnregisterHotKey(IntPtr hWnd, int id);

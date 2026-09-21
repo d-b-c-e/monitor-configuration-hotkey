@@ -21,7 +21,7 @@ static class Program
             foreach (var p in pm.Profiles)
             {
                 var hotkey = p.Hotkey != null ? $" ({p.Hotkey})" : "";
-                Console.WriteLine($"  {p.Name}{hotkey} — {p.Monitors.Length} monitor(s)");
+                Console.WriteLine($"  {p.Name}{hotkey} — {p.DisplaySummary}");
             }
             return;
         }
@@ -41,6 +41,20 @@ static class Program
         if (args.Length == 1 && args[0] == "--status")
         {
             Console.WriteLine(DisplayManager.DescribeCurrentConfig());
+            return;
+        }
+
+        if (args.Length == 1 && args[0] == "--validate-surround")
+        {
+            try
+            {
+                Console.WriteLine(NvidiaSurroundManager.ValidateActive());
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed: {ex.Message}");
+                Environment.Exit(1);
+            }
             return;
         }
 
@@ -71,7 +85,7 @@ static class Program
                 if (args.Length >= 3)
                     hotkey = ParseHotkeyArg(args[2]);
                 var profile = pm.CaptureProfile(name, hotkey);
-                Console.WriteLine($"Captured '{name}' — {profile.Monitors.Length} monitor(s)");
+                Console.WriteLine($"Captured '{name}' — {profile.DisplaySummary}");
                 foreach (var m in profile.Monitors)
                 {
                     var primary = m.IsPrimary ? " [PRIMARY]" : "";
@@ -88,7 +102,10 @@ static class Program
                 }
                 try
                 {
+                    bool legacySurround = target.IsNvidiaSurround && target.NvidiaSurround == null;
                     DisplayManager.ApplyProfile(target);
+                    if (legacySurround && target.NvidiaSurround != null)
+                        pm.Save();
                     Console.WriteLine($"Applied '{name}'");
                 }
                 catch (Exception ex)
@@ -112,6 +129,7 @@ static class Program
                 Console.Error.WriteLine("  MonitorProfileSwitcher delete \"Name\"         (delete a profile)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --list                (list profiles)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --status              (show current config)");
+                Console.Error.WriteLine("  MonitorProfileSwitcher --validate-surround   (validate active NVIDIA Surround grid)");
                 Environment.Exit(1);
                 break;
         }

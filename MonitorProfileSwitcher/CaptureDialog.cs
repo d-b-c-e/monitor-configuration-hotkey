@@ -65,7 +65,12 @@ internal class CaptureDialog : Form
                 var primary = m.IsPrimary ? " ★" : "";
                 return $"  {m.FriendlyName} — {m.Resolution.Width}x{m.Resolution.Height} @ {m.RefreshRate}{primary}";
             });
-            preview.Text = string.Join("\n", lines);
+            var current = lines.ToList();
+            var surround = NvidiaSurroundManager.TryCaptureActive();
+            if (surround != null)
+                current.Insert(0, $"  NVIDIA Surround {surround.Rows}x{surround.Columns} — " +
+                    $"{surround.WidthPerDisplay}x{surround.HeightPerDisplay} per display");
+            preview.Text = string.Join("\n", current);
         }
         catch { preview.Text = "  (unable to read display config)"; }
 

@@ -83,6 +83,7 @@ jobs:
 
             ### What's included
             - System tray app for switching monitor profiles via hotkeys
+            - NVIDIA Surround and independent-monitor profile switching
             - Global hotkey support (e.g., Ctrl+Alt+1 through 5)
             - Auto-update checks (every 24 hours)
             - Start with Windows via Scheduled Task (reliable with Fast Startup)

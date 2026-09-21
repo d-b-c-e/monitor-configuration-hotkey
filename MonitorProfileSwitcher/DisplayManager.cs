@@ -78,6 +78,24 @@ internal static class DisplayManager
 
     public static void ApplyProfile(DisplayProfile profile)
     {
+        // Surround is created by the NVIDIA driver, below Windows CCD. A newly captured
+        // profile carries the exact grid; a legacy "NV Surround" profile can still ask the
+        // driver to re-enable its last persisted grid.
+        if (profile.NvidiaSurround != null)
+        {
+            NvidiaSurroundManager.Apply(profile.NvidiaSurround);
+            return;
+        }
+        if (profile.IsNvidiaSurround)
+        {
+            profile.NvidiaSurround = NvidiaSurroundManager.ApplyLegacy(profile);
+            return;
+        }
+
+        // CCD cannot split a Surround source into physical monitors. Give the outputs back to
+        // Windows first, wait for the driver transition, then restore the saved Windows paths.
+        NvidiaSurroundManager.DisableIfActive();
+
         // Query ALL paths (including inactive)
         var (allPaths, _) = QueryConfig(
             QueryDisplayConfigFlags.QDC_ALL_PATHS |
@@ -340,7 +358,11 @@ internal static class DisplayManager
     public static string DescribeCurrentConfig()
     {
         var snapshot = CaptureCurrentConfig();
-        var lines = new List<string> { $"Active monitors ({snapshot.Monitors.Length}):" };
+        var lines = new List<string>
+        {
+            NvidiaSurroundManager.DescribeActive(),
+            $"Active Windows monitors ({snapshot.Monitors.Length}):"
+        };
         foreach (var m in snapshot.Monitors)
         {
             var primary = m.IsPrimary ? " [PRIMARY]" : "";

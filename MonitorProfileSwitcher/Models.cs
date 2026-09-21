@@ -8,7 +8,45 @@ internal class DisplayProfile
     public string Name { get; set; } = "";
     public HotkeyBinding? Hotkey { get; set; }
     public MonitorInfo[] Monitors { get; set; } = [];
+    public NvidiaSurroundConfig? NvidiaSurround { get; set; }
     public DateTime CapturedAt { get; set; } = DateTime.UtcNow;
+
+    [JsonIgnore]
+    public bool IsNvidiaSurround => NvidiaSurround != null ||
+        (Monitors.Length == 1 && Monitors[0].FriendlyName.Equals("NV Surround", StringComparison.OrdinalIgnoreCase));
+
+    [JsonIgnore]
+    public string DisplaySummary => NvidiaSurround != null
+        ? $"NVIDIA Surround {NvidiaSurround.Rows}x{NvidiaSurround.Columns}"
+        : $"{Monitors.Length} monitor(s)";
+}
+
+/// <summary>
+/// The NVIDIA driver topology needed to recreate a Surround display. Windows CCD only sees
+/// the resulting large logical monitor, so these driver-level details must be saved separately.
+/// </summary>
+internal class NvidiaSurroundConfig
+{
+    public uint Rows { get; set; }
+    public uint Columns { get; set; }
+    public uint WidthPerDisplay { get; set; }
+    public uint HeightPerDisplay { get; set; }
+    public uint BitsPerPixel { get; set; } = 32;
+    public uint Frequency { get; set; }
+    public bool ApplyWithBezelCorrection { get; set; }
+    public bool ImmersiveGaming { get; set; } = true;
+    public bool AcceleratePrimaryDisplay { get; set; }
+    public NvidiaSurroundDisplay[] Displays { get; set; } = [];
+}
+
+internal class NvidiaSurroundDisplay
+{
+    public uint DisplayId { get; set; }
+    public int OverlapX { get; set; }
+    public int OverlapY { get; set; }
+    public uint Rotation { get; set; }
+    public uint CloneGroup { get; set; }
+    public uint PixelShiftType { get; set; }
 }
 
 internal class MonitorInfo
@@ -118,9 +156,18 @@ internal class HotkeyBinding
 
         return Key.ToUpper() switch
         {
-            "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
-            "F5" => 0x74, "F6" => 0x75, "F7" => 0x76, "F8" => 0x77,
-            "F9" => 0x78, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
+            "F1" => 0x70,
+            "F2" => 0x71,
+            "F3" => 0x72,
+            "F4" => 0x73,
+            "F5" => 0x74,
+            "F6" => 0x75,
+            "F7" => 0x76,
+            "F8" => 0x77,
+            "F9" => 0x78,
+            "F10" => 0x79,
+            "F11" => 0x7A,
+            "F12" => 0x7B,
             _ => 0
         };
     }

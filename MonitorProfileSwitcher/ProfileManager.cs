@@ -57,6 +57,7 @@ internal class ProfileManager
             Name = name,
             Hotkey = hotkey,
             Monitors = snapshot.Monitors,
+            NvidiaSurround = NvidiaSurroundManager.TryCaptureActive(),
             CapturedAt = DateTime.UtcNow
         };
 

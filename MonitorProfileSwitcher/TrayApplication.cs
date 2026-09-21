@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using MonitorProfileSwitcher.Native;
 
 namespace MonitorProfileSwitcher;
@@ -15,6 +16,13 @@ internal class TrayApplication : ApplicationContext
     private Control? _uiMarshal;
     private System.Windows.Forms.Timer? _reloadTimer;
     private System.Windows.Forms.Timer? _taskbarPoll;
+    private System.Windows.Forms.Timer? _hotkeyRetry;
+
+    /// <summary>Profiles whose hotkey would not register, retried until they do or we give up.</summary>
+    private readonly List<DisplayProfile> _failedHotkeys = new();
+
+    /// <summary>Win32 error from the most recent failed registration, for the message we show.</summary>
+    private int _lastHotkeyError;
 
     public TrayApplication()
     {
@@ -59,9 +67,8 @@ internal class TrayApplication : ApplicationContext
             foreach (var profile in _profileManager.Profiles)
             {
                 var hotkeyText = profile.Hotkey != null ? $"  ({profile.Hotkey})" : "";
-                var monitorCount = profile.Monitors.Length;
                 var item = menu.Items.Add(
-                    $"{profile.Name}{hotkeyText}  [{monitorCount} monitor(s)]");
+                    $"{profile.Name}{hotkeyText}  [{profile.DisplaySummary}]");
                 item.Click += (_, _) => ApplyProfile(profile);
             }
             menu.Items.Add(new ToolStripSeparator());
@@ -161,7 +168,7 @@ internal class TrayApplication : ApplicationContext
             RebuildContextMenu();
 
             var hotkeyText = hotkey != null ? $" ({hotkey})" : "";
-            ShowBalloon($"Captured '{profile.Name}'{hotkeyText} — {profile.Monitors.Length} monitor(s)");
+            ShowBalloon($"Captured '{profile.Name}'{hotkeyText} — {profile.DisplaySummary}");
         }
     }
 
@@ -187,7 +194,10 @@ internal class TrayApplication : ApplicationContext
             // backup, sync). Re-fetch by name so we apply the current saved monitors.
             _profileManager.Reload();
             var fresh = _profileManager.GetProfile(profile.Name) ?? profile;
+            bool legacySurround = fresh.IsNvidiaSurround && fresh.NvidiaSurround == null;
             DisplayManager.ApplyProfile(fresh);
+            if (legacySurround && fresh.NvidiaSurround != null)
+                _profileManager.Save();
             ShowBalloon($"Switched to '{fresh.Name}'");
         }
         catch (Exception ex)
@@ -330,24 +340,113 @@ internal class TrayApplication : ApplicationContext
     {
         if (_hotkeyWindow == null) return;
 
+        _failedHotkeys.Clear();
+
         foreach (var profile in _profileManager.Profiles)
         {
             if (profile.Hotkey == null) continue;
-            var vk = profile.Hotkey.GetVirtualKeyCode();
-            if (vk == 0) continue;
+            if (profile.Hotkey.GetVirtualKeyCode() == 0) continue;
 
-            int id = _nextHotkeyId++;
-            if (HotkeyApi.RegisterHotKey(_hotkeyWindow.Handle, id,
-                profile.Hotkey.GetModifiers(), vk))
-            {
-                _hotkeyMap[id] = profile;
-            }
+            if (!TryRegisterHotkey(profile))
+                _failedHotkeys.Add(profile);
         }
+
+        if (_failedHotkeys.Count > 0)
+            GuardAgainstFailedHotkeys();
+    }
+
+    /// <summary>Registers one profile's hotkey, recording the failure reason if it does not take.</summary>
+    private bool TryRegisterHotkey(DisplayProfile profile)
+    {
+        int id = _nextHotkeyId++;
+        if (HotkeyApi.RegisterHotKey(_hotkeyWindow!.Handle, id,
+            profile.Hotkey!.GetModifiers(), profile.Hotkey.GetVirtualKeyCode()))
+        {
+            _hotkeyMap[id] = profile;
+            return true;
+        }
+
+        _lastHotkeyError = Marshal.GetLastWin32Error();
+        return false;
+    }
+
+    /// <summary>
+    /// Retry hotkeys that would not register at startup, and say so if they never do.
+    ///
+    /// The logon scheduled task can start this app fractionally before the shell, and
+    /// registration is not reliable that early — observed on 2026-09-09, where the app started
+    /// 0.1s ahead of Explorer and came up with no tray icon AND no working hotkeys. The tray
+    /// icon already had a guard for that race; hotkeys did not, on the assumption that
+    /// RegisterHotKey is independent of the shell. It is not reliably so this early in a session.
+    ///
+    /// The old behaviour was the real defect: a failed registration was discarded without a
+    /// retry, a log or any visible sign, so a tool whose entire purpose is hotkeys would start,
+    /// look healthy, sit in the tray and do nothing. Failing loudly matters more than the retry.
+    ///
+    /// Costs nothing on the normal path: if everything registers, no timer is ever created.
+    /// </summary>
+    private void GuardAgainstFailedHotkeys()
+    {
+        if (_hotkeyRetry != null) return;
+
+        var waited = TimeSpan.Zero;
+        var timeout = TimeSpan.FromSeconds(60);
+
+        _hotkeyRetry = new System.Windows.Forms.Timer { Interval = 2000 };
+        _hotkeyRetry.Tick += (_, _) =>
+        {
+            waited += TimeSpan.FromMilliseconds(_hotkeyRetry!.Interval);
+
+            for (int i = _failedHotkeys.Count - 1; i >= 0; i--)
+            {
+                if (TryRegisterHotkey(_failedHotkeys[i]))
+                    _failedHotkeys.RemoveAt(i);
+            }
+
+            if (_failedHotkeys.Count == 0)
+            {
+                StopHotkeyRetry();
+            }
+            else if (waited >= timeout)
+            {
+                StopHotkeyRetry();
+                ReportFailedHotkeys();
+            }
+        };
+        _hotkeyRetry.Start();
+    }
+
+    private void StopHotkeyRetry()
+    {
+        _hotkeyRetry?.Stop();
+        _hotkeyRetry?.Dispose();
+        _hotkeyRetry = null;
+    }
+
+    /// <summary>Tell the user which hotkeys are dead, rather than leaving them to discover it by
+    /// pressing one and wondering whether the app crashed.</summary>
+    private void ReportFailedHotkeys()
+    {
+        var names = string.Join(", ", _failedHotkeys.Select(p => $"{p.Hotkey} ({p.Name})"));
+        var reason = _lastHotkeyError == HotkeyApi.ERROR_HOTKEY_ALREADY_REGISTERED
+            ? "another application already owns it"
+            : $"Windows error {_lastHotkeyError}";
+
+        ShowBalloon($"Hotkey not registered: {names} — {reason}. The profile still works from this menu.",
+            ToolTipIcon.Warning);
+
+        _trayIcon.Text = "Monitor Profile Switcher (hotkeys unavailable)";
     }
 
     private void UnregisterAllHotkeys()
     {
         if (_hotkeyWindow == null) return;
+
+        // A reload re-registers everything from scratch, so an in-flight retry is now chasing
+        // stale profile objects. Drop it and let RegisterAllHotkeys start a fresh one if needed.
+        StopHotkeyRetry();
+        _failedHotkeys.Clear();
+        _trayIcon.Text = "Monitor Profile Switcher";
 
         foreach (var id in _hotkeyMap.Keys)
         {
