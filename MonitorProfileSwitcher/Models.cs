@@ -126,6 +126,15 @@ internal class HotkeyBinding
     public bool Win { get; set; }
     public string Key { get; set; } = "";
 
+    public HotkeyBinding Clone() => new()
+    {
+        Ctrl = Ctrl,
+        Alt = Alt,
+        Shift = Shift,
+        Win = Win,
+        Key = Key,
+    };
+
     public override string ToString()
     {
         var parts = new List<string>();
@@ -171,6 +180,14 @@ internal class HotkeyBinding
             _ => 0
         };
     }
+}
+
+internal sealed class ProfileMetadataEdit
+{
+    public required string OriginalName { get; init; }
+    public required string Name { get; set; }
+    public required string DisplaySummary { get; init; }
+    public HotkeyBinding? Hotkey { get; set; }
 }
 
 internal class ProfileStore

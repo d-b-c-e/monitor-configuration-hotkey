@@ -7,6 +7,17 @@ static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        AppLog.Initialize(args.Length == 0 ? "tray" : string.Join(' ', args));
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, eventArgs) => AppLog.Error("Unhandled UI-thread exception.", eventArgs.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+            AppLog.Error("Unhandled application exception.", eventArgs.ExceptionObject as Exception);
+        TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
+        {
+            AppLog.Error("Unobserved task exception.", eventArgs.Exception);
+            eventArgs.SetObserved();
+        };
+
         // CLI mode: mps capture "Profile Name" or mps apply "Profile Name"
         if (args.Length >= 2)
         {
@@ -63,7 +74,10 @@ static class Program
         using var singleInstance = new Mutex(
             initiallyOwned: true, @"Local\MonitorProfileSwitcher_SingleInstance", out bool createdNew);
         if (!createdNew)
+        {
+            AppLog.Info("Tray startup ended because another instance is already running.");
             return; // another tray instance is already running
+        }
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
@@ -81,6 +95,7 @@ static class Program
         switch (command)
         {
             case "capture":
+                AppLog.Info($"CLI capture requested for profile '{name}'.");
                 HotkeyBinding? hotkey = null;
                 if (args.Length >= 3)
                     hotkey = ParseHotkeyArg(args[2]);
@@ -94,6 +109,8 @@ static class Program
                 break;
 
             case "apply":
+                var operationId = Guid.NewGuid().ToString("N")[..8];
+                AppLog.Info($"[{operationId}] CLI apply requested for profile '{name}'. Before:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
                 var target = pm.GetProfile(name);
                 if (target == null)
                 {
@@ -106,16 +123,19 @@ static class Program
                     DisplayManager.ApplyProfile(target);
                     if (legacySurround && target.NvidiaSurround != null)
                         pm.Save();
+                    AppLog.Info($"[{operationId}] CLI apply completed for profile '{name}'. After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
                     Console.WriteLine($"Applied '{name}'");
                 }
                 catch (Exception ex)
                 {
+                    AppLog.Error($"[{operationId}] CLI apply failed for profile '{name}'. Current state:{Environment.NewLine}{SafeDescribeCurrentConfig()}", ex);
                     Console.Error.WriteLine($"Failed: {ex.Message}");
                     Environment.Exit(1);
                 }
                 break;
 
             case "delete":
+                AppLog.Info($"CLI delete requested for profile '{name}'.");
                 pm.DeleteProfile(name);
                 Console.WriteLine($"Deleted '{name}'");
                 break;
@@ -133,6 +153,12 @@ static class Program
                 Environment.Exit(1);
                 break;
         }
+    }
+
+    private static string SafeDescribeCurrentConfig()
+    {
+        try { return DisplayManager.DescribeCurrentConfig(); }
+        catch (Exception ex) { return $"Unable to read current display configuration: {ex.Message}"; }
     }
 
     private static HotkeyBinding? ParseHotkeyArg(string arg)

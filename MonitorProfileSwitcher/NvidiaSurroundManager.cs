@@ -27,6 +27,7 @@ internal static class NvidiaSurroundManager
             }
             catch (Exception ex) when (IsUnavailable(ex))
             {
+                AppLog.Warn($"NVIDIA Surround capture is unavailable: {ex.Message}");
                 return null;
             }
             finally
@@ -46,17 +47,21 @@ internal static class NvidiaSurroundManager
             WithNvApi(() =>
             {
                 var grid = ToNative(config);
+                AppLog.Info($"NVAPI applying Surround grid {config.Rows}x{config.Columns}, {config.WidthPerDisplay}x{config.HeightPerDisplay}@{config.Frequency}, displays={string.Join(",", config.Displays.Select(display => display.DisplayId))}.");
                 ValidateNativeGrid(grid);
                 try
                 {
                     NvApi.SetDisplayGrids([grid]);
+                    AppLog.Info("NVAPI SetDisplayGrids accepted the Surround grid.");
                 }
                 catch (NvidiaApiException ex) when (ex.Status is -3 or -9)
                 {
                     // Some GeForce drivers expose grid enumeration but reject the public
                     // SetDisplayGrids structure version. Enabling the driver's persisted current
                     // topology is the documented fallback and is exactly what Control Panel does.
+                    AppLog.Warn($"NVAPI SetDisplayGrids returned {ex.Status}; enabling the driver's persisted topology instead.");
                     NvApi.EnableCurrentTopology(true);
+                    AppLog.Info("NVAPI enabled the persisted Surround topology.");
                 }
                 WaitForState(expectedActive: true, config);
             });
@@ -93,6 +98,7 @@ internal static class NvidiaSurroundManager
             {
                 migrated = CaptureActiveCore() ?? InferLegacyGrid(profile);
                 var grid = ToNative(migrated);
+                AppLog.Info($"NVAPI applying inferred legacy Surround grid {migrated.Rows}x{migrated.Columns}.");
                 ValidateNativeGrid(grid);
                 NvApi.SetDisplayGrids([grid]);
                 WaitForState(expectedActive: true, migrated);
@@ -114,20 +120,19 @@ internal static class NvidiaSurroundManager
                 initialized = true;
                 var active = CaptureActiveCore();
                 if (active == null)
+                {
+                    AppLog.Info("NVAPI reports Surround is already inactive; no driver transition needed.");
                     return false;
+                }
 
-                try
-                {
-                    NvApi.EnableCurrentTopology(false);
-                }
-                catch (NvidiaApiException ex) when (ex.Status is -9 or -150)
-                {
-                    // Current GeForce drivers can enumerate and enable an immersive grid but
-                    // return MODE_CHANGE_FAILED when disabling it through the older toggle API.
-                    // NVIDIA's current SetDisplayGrids contract explicitly defines a 1x1 grid
-                    // as the way to leave a multi-display grid.
-                    NvApi.SetDisplayGrids([ToSingleDisplayGrid(active)]);
-                }
+                // Current GeForce drivers can return MODE_CHANGE_FAILED — and can display an
+                // NVIDIA error popup — when the older topology-toggle API is used to disable
+                // Surround. NVIDIA's current contract defines a 1x1 display grid as the way to
+                // leave a multi-display grid, so use that path directly.
+                var singleDisplayGrid = ToSingleDisplayGrid(active);
+                AppLog.Info($"NVAPI leaving Surround {active.Rows}x{active.Columns} via direct 1x1 grid on display {singleDisplayGrid.Displays[0].DisplayId}.");
+                NvApi.SetDisplayGrids([singleDisplayGrid]);
+                AppLog.Info("NVAPI accepted the direct 1x1 grid used to leave Surround.");
                 disabled = true;
                 WaitForState(expectedActive: false, expected: null);
                 return true;
@@ -135,6 +140,7 @@ internal static class NvidiaSurroundManager
             catch (Exception ex) when (!disabled && IsUnavailable(ex))
             {
                 // A normal Windows-only profile must continue to work on non-NVIDIA systems.
+                AppLog.Warn($"NVIDIA Surround disable check is unavailable; continuing with Windows CCD: {ex.Message}");
                 return false;
             }
             finally
@@ -343,6 +349,7 @@ internal static class NvidiaSurroundManager
         }
         catch (NvidiaApiException ex) when (ex.Status is -3 or -9)
         {
+            AppLog.Warn($"NVAPI display-grid validation is unavailable (status {ex.Status}); continuing with the captured grid.");
             return false;
         }
 
@@ -370,9 +377,15 @@ internal static class NvidiaSurroundManager
             {
                 var active = CaptureActiveCore();
                 if (!expectedActive && active == null)
+                {
+                    AppLog.Info($"NVAPI state reached Surround inactive after {timeout.ElapsedMilliseconds}ms.");
                     return;
+                }
                 if (expectedActive && active != null && (expected == null || Matches(active, expected)))
+                {
+                    AppLog.Info($"NVAPI state reached Surround active {active.Rows}x{active.Columns} after {timeout.ElapsedMilliseconds}ms.");
                     return;
+                }
             }
             catch (Exception ex)
             {
@@ -383,6 +396,7 @@ internal static class NvidiaSurroundManager
         }
 
         string target = expectedActive ? "become active" : "turn off";
+        AppLog.Error($"Timed out after {timeout.ElapsedMilliseconds}ms waiting for NVIDIA Surround to {target}.", lastError);
         throw new TimeoutException($"Timed out waiting for NVIDIA Surround to {target}.", lastError);
     }
 

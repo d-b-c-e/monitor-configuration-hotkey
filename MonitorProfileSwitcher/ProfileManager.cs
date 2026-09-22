@@ -31,11 +31,13 @@ internal class ProfileManager
         if (!File.Exists(ProfilePath))
         {
             _store = new ProfileStore();
+            AppLog.Info($"No profile store found at {ProfilePath}; starting with an empty store.");
             return;
         }
 
         var json = File.ReadAllText(ProfilePath);
         _store = JsonSerializer.Deserialize<ProfileStore>(json, JsonOptions) ?? new ProfileStore();
+        AppLog.Info($"Loaded {_store.Profiles.Count} profile(s) from {ProfilePath}.");
     }
 
     /// <summary>Re-read profiles.json from disk, discarding the in-memory copy. Use when the
@@ -46,7 +48,10 @@ internal class ProfileManager
     {
         Directory.CreateDirectory(ProfileDir);
         var json = JsonSerializer.Serialize(_store, JsonOptions);
-        File.WriteAllText(ProfilePath, json);
+        var temporaryPath = ProfilePath + ".tmp";
+        File.WriteAllText(temporaryPath, json);
+        File.Move(temporaryPath, ProfilePath, true);
+        AppLog.Info($"Saved {_store.Profiles.Count} profile(s) to {ProfilePath}.");
     }
 
     public DisplayProfile CaptureProfile(string name, HotkeyBinding? hotkey = null)
@@ -80,7 +85,7 @@ internal class ProfileManager
         Save();
     }
 
-    public void SetHotkey(string profileName, HotkeyBinding hotkey)
+    public void SetHotkey(string profileName, HotkeyBinding? hotkey)
     {
         var profile = _store.Profiles.FirstOrDefault(p =>
             p.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
@@ -89,6 +94,38 @@ internal class ProfileManager
             profile.Hotkey = hotkey;
             Save();
         }
+    }
+
+    public void ApplyMetadataChanges(IReadOnlyList<ProfileMetadataEdit> edits)
+    {
+        if (edits.Count != _store.Profiles.Count)
+            throw new InvalidOperationException("The profile list changed while it was being edited. Reopen Manage Profiles and try again.");
+
+        var existingByName = _store.Profiles.ToDictionary(profile => profile.Name, StringComparer.OrdinalIgnoreCase);
+        var originals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var newNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var reordered = new List<DisplayProfile>(edits.Count);
+
+        foreach (var edit in edits)
+        {
+            if (!originals.Add(edit.OriginalName) || !existingByName.TryGetValue(edit.OriginalName, out var profile))
+                throw new InvalidOperationException("The profile list changed while it was being edited. Reopen Manage Profiles and try again.");
+
+            var name = edit.Name.Trim();
+            if (name.Length == 0)
+                throw new InvalidOperationException("Profile names cannot be blank.");
+            if (!newNames.Add(name))
+                throw new InvalidOperationException($"More than one profile is named '{name}'. Profile names must be unique.");
+
+            profile.Name = name;
+            profile.Hotkey = edit.Hotkey?.Clone();
+            reordered.Add(profile);
+        }
+
+        _store.Profiles.Clear();
+        _store.Profiles.AddRange(reordered);
+        Save();
+        AppLog.Info($"Updated profile names, order, and hotkeys: {string.Join(", ", reordered.Select(profile => $"{profile.Name} [{profile.Hotkey?.ToString() ?? "no hotkey"}]"))}");
     }
 
     public DisplayProfile? GetProfile(string name)

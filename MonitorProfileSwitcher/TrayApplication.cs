@@ -28,6 +28,7 @@ internal class TrayApplication : ApplicationContext
     {
         _profileManager = new ProfileManager();
         _profileManager.Load();
+        AppLog.Info("Initializing tray application.");
 
         _trayIcon = new NotifyIcon
         {
@@ -69,7 +70,7 @@ internal class TrayApplication : ApplicationContext
                 var hotkeyText = profile.Hotkey != null ? $"  ({profile.Hotkey})" : "";
                 var item = menu.Items.Add(
                     $"{profile.Name}{hotkeyText}  [{profile.DisplaySummary}]");
-                item.Click += (_, _) => ApplyProfile(profile);
+                item.Click += (_, _) => ApplyProfile(profile, "tray menu");
             }
             menu.Items.Add(new ToolStripSeparator());
         }
@@ -81,19 +82,19 @@ internal class TrayApplication : ApplicationContext
         // Manage
         if (_profileManager.Profiles.Count > 0)
         {
-            var manageMenu = new ToolStripMenuItem("Manage Profiles");
+            var manageItem = menu.Items.Add("Manage Profiles...");
+            manageItem.Click += (_, _) => ManageProfiles();
+
+            var actionsMenu = new ToolStripMenuItem("Profile Actions");
             foreach (var profile in _profileManager.Profiles)
             {
                 var profileMenu = new ToolStripMenuItem(profile.Name);
-
-                var setHotkey = new ToolStripMenuItem("Set Hotkey...");
-                setHotkey.Click += (_, _) => SetProfileHotkey(profile.Name);
-                profileMenu.DropDownItems.Add(setHotkey);
 
                 var recapture = new ToolStripMenuItem("Recapture (update to current)");
                 recapture.Click += (_, _) =>
                 {
                     _profileManager.CaptureProfile(profile.Name, profile.Hotkey);
+                    AppLog.Info($"Recaptured profile '{profile.Name}'.");
                     ShowBalloon($"Profile '{profile.Name}' updated");
                 };
                 profileMenu.DropDownItems.Add(recapture);
@@ -102,15 +103,17 @@ internal class TrayApplication : ApplicationContext
                 delete.Click += (_, _) =>
                 {
                     _profileManager.DeleteProfile(profile.Name);
+                    AppLog.Info($"Deleted profile '{profile.Name}'.");
                     UnregisterAllHotkeys();
                     RegisterAllHotkeys();
+                    RebuildContextMenu();
                     ShowBalloon($"Profile '{profile.Name}' deleted");
                 };
                 profileMenu.DropDownItems.Add(delete);
 
-                manageMenu.DropDownItems.Add(profileMenu);
+                actionsMenu.DropDownItems.Add(profileMenu);
             }
-            menu.Items.Add(manageMenu);
+            menu.Items.Add(actionsMenu);
             menu.Items.Add(new ToolStripSeparator());
         }
 
@@ -121,6 +124,13 @@ internal class TrayApplication : ApplicationContext
             var desc = DisplayManager.DescribeCurrentConfig();
             MessageBox.Show(desc, "Current Display Configuration",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+
+        var openLogs = menu.Items.Add("Open Logs");
+        openLogs.Click += (_, _) =>
+        {
+            try { AppLog.OpenLogFolder(); }
+            catch (Exception ex) { ShowBalloon($"Could not open logs: {ex.Message}", ToolTipIcon.Error); }
         };
 
         // Update
@@ -145,6 +155,7 @@ internal class TrayApplication : ApplicationContext
         var exitItem = menu.Items.Add("Exit");
         exitItem.Click += (_, _) =>
         {
+            AppLog.Info("Tray application exiting by user request.");
             UnregisterAllHotkeys();
             _profileWatcher?.Dispose();
             StopTaskbarPoll();
@@ -162,6 +173,7 @@ internal class TrayApplication : ApplicationContext
         {
             var hotkey = dialog.SelectedHotkey;
             var profile = _profileManager.CaptureProfile(dialog.ProfileName, hotkey);
+            AppLog.Info($"Captured profile '{profile.Name}' ({profile.DisplaySummary}) with hotkey {hotkey?.ToString() ?? "none"}.");
 
             UnregisterAllHotkeys();
             RegisterAllHotkeys();
@@ -172,21 +184,32 @@ internal class TrayApplication : ApplicationContext
         }
     }
 
-    private void SetProfileHotkey(string profileName)
+    private void ManageProfiles()
     {
-        using var dialog = new HotkeyDialog();
-        if (dialog.ShowDialog() == DialogResult.OK && dialog.SelectedHotkey != null)
+        using var dialog = new ManageProfilesDialog(_profileManager.Profiles);
+        if (dialog.ShowDialog() != DialogResult.OK)
+            return;
+
+        try
         {
-            _profileManager.SetHotkey(profileName, dialog.SelectedHotkey);
+            _profileManager.ApplyMetadataChanges(dialog.Edits);
             UnregisterAllHotkeys();
             RegisterAllHotkeys();
             RebuildContextMenu();
-            ShowBalloon($"Hotkey for '{profileName}' set to {dialog.SelectedHotkey}");
+            ShowBalloon("Profile changes saved");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("Failed to save changes from Manage Profiles.", ex);
+            MessageBox.Show($"Could not save profile changes: {ex.Message}", "Manage Profiles",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
-    private void ApplyProfile(DisplayProfile profile)
+    private void ApplyProfile(DisplayProfile profile, string trigger)
     {
+        var operationId = Guid.NewGuid().ToString("N")[..8];
+        var started = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             // Re-read profiles.json from disk first: this instance loaded profiles at
@@ -194,14 +217,17 @@ internal class TrayApplication : ApplicationContext
             // backup, sync). Re-fetch by name so we apply the current saved monitors.
             _profileManager.Reload();
             var fresh = _profileManager.GetProfile(profile.Name) ?? profile;
+            AppLog.Info($"[{operationId}] Apply started. Profile='{fresh.Name}' Trigger='{trigger}' Type='{fresh.DisplaySummary}' Before:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
             bool legacySurround = fresh.IsNvidiaSurround && fresh.NvidiaSurround == null;
             DisplayManager.ApplyProfile(fresh);
             if (legacySurround && fresh.NvidiaSurround != null)
                 _profileManager.Save();
+            AppLog.Info($"[{operationId}] Apply completed in {started.ElapsedMilliseconds}ms. Profile='{fresh.Name}' After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
             ShowBalloon($"Switched to '{fresh.Name}'");
         }
         catch (Exception ex)
         {
+            AppLog.Error($"[{operationId}] Apply failed after {started.ElapsedMilliseconds}ms. Profile='{profile.Name}' Current state:{Environment.NewLine}{SafeDescribeCurrentConfig()}", ex);
             ShowBalloon($"Failed: {ex.Message}", ToolTipIcon.Error);
         }
     }
@@ -270,8 +296,9 @@ internal class TrayApplication : ApplicationContext
             _trayIcon.Visible = false;
             _trayIcon.Visible = true;
         }
-        catch
+        catch (Exception ex)
         {
+            AppLog.Error("Failed to re-register the tray icon.", ex);
             // Nothing useful to do, and not worth taking the app down over — the hotkeys
             // keep working with or without an icon.
         }
@@ -308,8 +335,9 @@ internal class TrayApplication : ApplicationContext
             _profileWatcher.Renamed += (_, _) => DebouncedReload();
             _profileWatcher.EnableRaisingEvents = true;
         }
-        catch
+        catch (Exception ex)
         {
+            AppLog.Error("Failed to initialize profiles.json watcher.", ex);
             // ignore — the reload-before-apply path still keeps applies correct.
         }
     }
@@ -329,9 +357,11 @@ internal class TrayApplication : ApplicationContext
             UnregisterAllHotkeys();
             RegisterAllHotkeys();
             RebuildContextMenu();
+            AppLog.Info("Reloaded profiles after an external profiles.json change.");
         }
-        catch
+        catch (Exception ex)
         {
+            AppLog.Warn($"Could not reload profiles after a file change: {ex.Message}");
             // Transient read error (file mid-write); the next event will retry.
         }
     }
@@ -363,10 +393,12 @@ internal class TrayApplication : ApplicationContext
             profile.Hotkey!.GetModifiers(), profile.Hotkey.GetVirtualKeyCode()))
         {
             _hotkeyMap[id] = profile;
+            AppLog.Info($"Registered hotkey {profile.Hotkey} for profile '{profile.Name}'.");
             return true;
         }
 
         _lastHotkeyError = Marshal.GetLastWin32Error();
+        AppLog.Warn($"Could not register hotkey {profile.Hotkey} for profile '{profile.Name}'. Windows error {_lastHotkeyError}.");
         return false;
     }
 
@@ -434,6 +466,7 @@ internal class TrayApplication : ApplicationContext
 
         ShowBalloon($"Hotkey not registered: {names} — {reason}. The profile still works from this menu.",
             ToolTipIcon.Warning);
+        AppLog.Warn($"Hotkey registration permanently failed: {names} — {reason}.");
 
         _trayIcon.Text = "Monitor Profile Switcher (hotkeys unavailable)";
     }
@@ -460,7 +493,7 @@ internal class TrayApplication : ApplicationContext
     {
         if (_hotkeyMap.TryGetValue(hotkeyId, out var profile))
         {
-            ApplyProfile(profile);
+            ApplyProfile(profile, $"hotkey {profile.Hotkey}");
         }
     }
 
@@ -480,8 +513,9 @@ internal class TrayApplication : ApplicationContext
                 ShowBalloon("You're running the latest version.");
             }
         }
-        catch
+        catch (Exception ex)
         {
+            AppLog.Error("Update check failed.", ex);
             if (!silent)
                 ShowBalloon("Unable to check for updates.", ToolTipIcon.Warning);
         }
@@ -510,6 +544,12 @@ internal class TrayApplication : ApplicationContext
         _trayIcon.BalloonTipText = text;
         _trayIcon.BalloonTipIcon = icon;
         _trayIcon.ShowBalloonTip(3000);
+    }
+
+    private static string SafeDescribeCurrentConfig()
+    {
+        try { return DisplayManager.DescribeCurrentConfig(); }
+        catch (Exception ex) { return $"Unable to read current display configuration: {ex.Message}"; }
     }
 
     private static Icon LoadEmbeddedIcon()

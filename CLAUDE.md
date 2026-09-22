@@ -10,6 +10,7 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - Uses NVIDIA NVAPI Mosaic/immersive-gaming calls for Surround topologies
 - Monitors identified by persistent `monitorDevicePath` (survives reboots, unlike adapter LUIDs)
 - Profiles saved as JSON in `%LOCALAPPDATA%\MonitorProfileSwitcher\profiles.json`
+- Rotating diagnostics saved in `%LOCALAPPDATA%\MonitorProfileSwitcher\logs\app.log`
 - Global hotkeys via `RegisterHotKey` Win32 API
 
 ## Key Files
@@ -22,7 +23,9 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - `NvidiaSurroundManager.cs` — Capture, validate, migrate, enable, and disable Surround grids
 - `ProfileManager.cs` — JSON serialization, CRUD for profiles
 - `TrayApplication.cs` — System tray icon, context menu, hotkey handling
-- `CaptureDialog.cs` / `HotkeyDialog.cs` — Minimal WinForms dialogs
+- `ManageProfilesDialog.cs` — Profile ordering, renaming, and hotkey management
+- `CaptureDialog.cs` / `HotkeyDialog.cs` — Capture and hotkey WinForms dialogs
+- `AppLog.cs` — Non-fatal rotating file diagnostics
 - `Models.cs` — Data models for profiles, monitors, hotkeys
 - `Program.cs` — Entry point with CLI and tray modes
 - `DebugDump.cs` — Raw CCD path/mode diagnostics
@@ -50,8 +53,10 @@ MonitorProfileSwitcher --list               # list saved profiles
   per-panel mode, overlap/bezel data, rotation and pixel-shift metadata alongside the logical
   Windows `NV Surround` monitor.
 - Applying a Surround profile asks NVAPI to restore that grid and waits for it to become active.
-  Applying a normal profile first disables the persisted NVIDIA topology, waits for the three
-  physical outputs to return, then runs the existing CCD apply.
+  Applying a normal profile leaves Surround through NVAPI's direct 1x1-grid path, waits for the
+  physical outputs to return, then runs the existing CCD apply. The older topology-toggle disable
+  call is deliberately avoided because current GeForce drivers can return `MODE_CHANGE_FAILED`
+  and display an NVIDIA error popup even when a fallback subsequently succeeds.
 - Profiles captured before this support are recognized by their single `NV Surround` monitor.
   On first apply, the app infers a matching horizontal/vertical grid from active NVIDIA 1x1
   displays, enables it, and upgrades the profile in `profiles.json`. If the panel dimensions do
@@ -139,7 +144,8 @@ hotkeys at all.
 
 **Working**: CCD capture/apply, monitor enable/disable, position, primary display, resolution,
 rotation, refresh rate, NVIDIA Surround ↔ independent-monitor switching, profile persistence and
-legacy migration, tray UI, global hotkeys with retry/error reporting, CLI diagnostics, and updater.
+legacy migration, profile ordering/renaming/hotkey management, rotating switch diagnostics, tray UI,
+global hotkeys with retry/error reporting, CLI diagnostics, and updater.
 
 The 1x3 Surround → three independent displays → 1x3 Surround round trip was exercised on a
 GeForce RTX 5080 with three 2560x1440 panels. NVIDIA's optional validation API returns

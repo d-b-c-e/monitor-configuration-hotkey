@@ -83,18 +83,21 @@ internal static class DisplayManager
         // driver to re-enable its last persisted grid.
         if (profile.NvidiaSurround != null)
         {
+            AppLog.Info($"Applying NVIDIA Surround profile '{profile.Name}' ({profile.NvidiaSurround.Rows}x{profile.NvidiaSurround.Columns}, displays={string.Join(",", profile.NvidiaSurround.Displays.Select(display => display.DisplayId))}).");
             NvidiaSurroundManager.Apply(profile.NvidiaSurround);
             return;
         }
         if (profile.IsNvidiaSurround)
         {
+            AppLog.Info($"Applying legacy NVIDIA Surround profile '{profile.Name}'.");
             profile.NvidiaSurround = NvidiaSurroundManager.ApplyLegacy(profile);
             return;
         }
 
         // CCD cannot split a Surround source into physical monitors. Give the outputs back to
         // Windows first, wait for the driver transition, then restore the saved Windows paths.
-        NvidiaSurroundManager.DisableIfActive();
+        var surroundWasDisabled = NvidiaSurroundManager.DisableIfActive();
+        AppLog.Info($"Applying Windows display profile '{profile.Name}'. NVIDIA Surround transition required={surroundWasDisabled}.");
 
         // Query ALL paths (including inactive)
         var (allPaths, _) = QueryConfig(
@@ -194,6 +197,8 @@ internal static class DisplayManager
             SetDisplayConfigFlags.SDC_TOPOLOGY_SUPPLIED |
             SetDisplayConfigFlags.SDC_ALLOW_PATH_ORDER_CHANGES |
             SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE);
+
+        AppLog.Info($"SetDisplayConfig topology result={result}; requested={profile.Monitors.Length}; matched={activatedIndices.Count}; allPaths={allPaths.Length}.");
 
         if (result != DisplayConfigApi.ERROR_SUCCESS)
         {
@@ -308,10 +313,14 @@ internal static class DisplayManager
         }
 
         if (!changed)
+        {
+            AppLog.Info($"Layout for '{profile.Name}' already matched the saved positions, resolution, rotation, and refresh rate.");
             return;
+        }
 
         // Apply the adjusted layout
         int result = ApplySuppliedConfig(paths, modes);
+        AppLog.Info($"SetDisplayConfig layout result={result}; profile='{profile.Name}'; refreshRateChanged={rateChanged}; rotationChanges={rotationEdits.Count}.");
         if (result == DisplayConfigApi.ERROR_SUCCESS)
             return;
 
@@ -324,6 +333,7 @@ internal static class DisplayManager
                 pristinePaths[index].targetInfo.rotation = rotation;
 
             int retry = ApplySuppliedConfig(pristinePaths, modes);
+            AppLog.Warn($"Layout with saved refresh rate failed ({result}); retry without refresh rate returned {retry} for profile '{profile.Name}'.");
             if (retry == DisplayConfigApi.ERROR_SUCCESS)
             {
                 Console.Error.WriteLine(
@@ -336,6 +346,7 @@ internal static class DisplayManager
 
         // Non-fatal if layout apply fails — topology is already correct
         Console.Error.WriteLine($"Warning: Layout adjustment returned {result} — topology is correct but positions may differ");
+        AppLog.Warn($"Layout adjustment returned {result} for profile '{profile.Name}'; topology succeeded but positions may differ.");
     }
 
     /// <summary>Guards against a profile written before rotation was persisted, or edited by
