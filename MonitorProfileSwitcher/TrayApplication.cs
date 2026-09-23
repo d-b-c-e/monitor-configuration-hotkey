@@ -17,6 +17,8 @@ internal class TrayApplication : ApplicationContext
     private System.Windows.Forms.Timer? _reloadTimer;
     private System.Windows.Forms.Timer? _taskbarPoll;
     private System.Windows.Forms.Timer? _hotkeyRetry;
+    private Control? _ipcDispatchControl;
+    private IpcService? _ipcService;
 
     /// <summary>Profiles whose hotkey would not register, retried until they do or we give up.</summary>
     private readonly List<DisplayProfile> _failedHotkeys = new();
@@ -50,6 +52,8 @@ internal class TrayApplication : ApplicationContext
 
         SetupProfileWatcher();
         GuardAgainstMissingTrayIcon();
+        StartIpcService();
+        Application.ApplicationExit += (_, _) => _ipcService?.Dispose();
 
         // Check for updates on startup (fire-and-forget, rate-limited to once per 24h)
         if (UpdateService.ShouldCheck())
@@ -156,6 +160,8 @@ internal class TrayApplication : ApplicationContext
         exitItem.Click += (_, _) =>
         {
             AppLog.Info("Tray application exiting by user request.");
+            _ipcService?.Dispose();
+            _ipcDispatchControl?.Dispose();
             UnregisterAllHotkeys();
             _profileWatcher?.Dispose();
             StopTaskbarPoll();
@@ -206,7 +212,7 @@ internal class TrayApplication : ApplicationContext
         }
     }
 
-    private void ApplyProfile(DisplayProfile profile, string trigger)
+    private IpcResponse ApplyProfile(DisplayProfile profile, string trigger)
     {
         var operationId = Guid.NewGuid().ToString("N")[..8];
         var started = System.Diagnostics.Stopwatch.StartNew();
@@ -216,19 +222,119 @@ internal class TrayApplication : ApplicationContext
             // startup, and the file may have changed since (manual edit, restore from
             // backup, sync). Re-fetch by name so we apply the current saved monitors.
             _profileManager.Reload();
-            var fresh = _profileManager.GetProfile(profile.Name) ?? profile;
+            var fresh = _profileManager.GetProfile(profile.Name) ??
+                throw new InvalidOperationException($"Profile '{profile.Name}' no longer exists.");
             AppLog.Info($"[{operationId}] Apply started. Profile='{fresh.Name}' Trigger='{trigger}' Type='{fresh.DisplaySummary}' Before:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
             bool legacySurround = fresh.IsNvidiaSurround && fresh.NvidiaSurround == null;
             DisplayManager.ApplyProfile(fresh);
             if (legacySurround && fresh.NvidiaSurround != null)
                 _profileManager.Save();
+            var inspector = IpcDisplayInspector.Capture();
+            if (!inspector.Matches(fresh))
+                throw new InvalidOperationException("The driver finished the switch, but the live display layout does not match the saved profile. See Open Logs for details.");
+            var status = inspector.ToStatus(_profileManager.Profiles);
             AppLog.Info($"[{operationId}] Apply completed in {started.ElapsedMilliseconds}ms. Profile='{fresh.Name}' After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
             ShowBalloon($"Switched to '{fresh.Name}'");
+            return new IpcResponse
+            {
+                Success = true,
+                Message = $"Applied and verified profile '{fresh.Name}'.",
+                OperationId = operationId,
+                ProfileName = fresh.Name,
+                Status = status,
+            };
         }
         catch (Exception ex)
         {
             AppLog.Error($"[{operationId}] Apply failed after {started.ElapsedMilliseconds}ms. Profile='{profile.Name}' Current state:{Environment.NewLine}{SafeDescribeCurrentConfig()}", ex);
             ShowBalloon($"Failed: {ex.Message}", ToolTipIcon.Error);
+            return new IpcResponse
+            {
+                Success = false,
+                ErrorCode = "apply_failed",
+                Message = ex.Message,
+                OperationId = operationId,
+                ProfileName = profile.Name,
+            };
+        }
+    }
+
+    private void StartIpcService()
+    {
+        try
+        {
+            _ipcDispatchControl = new Control();
+            _ = _ipcDispatchControl.Handle;
+            _ipcService = new IpcService(DispatchIpcAsync);
+            _ipcService.Start();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error("Failed to start IPC server.", ex);
+        }
+    }
+
+    private Task<IpcResponse> DispatchIpcAsync(IpcRequest request)
+    {
+        var completion = new TaskCompletionSource<IpcResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            _ipcDispatchControl!.BeginInvoke(new Action(() =>
+            {
+                try { completion.SetResult(HandleIpcRequest(request)); }
+                catch (Exception ex)
+                {
+                    AppLog.Error($"IPC command '{request.Command}' failed.", ex);
+                    completion.SetResult(IpcResponse.Error("command_failed", ex.Message));
+                }
+            }));
+        }
+        catch (Exception ex)
+        {
+            completion.SetResult(IpcResponse.Error("unavailable", $"The tray application is closing: {ex.Message}"));
+        }
+        return completion.Task;
+    }
+
+    private IpcResponse HandleIpcRequest(IpcRequest request)
+    {
+        switch (request.Command?.Trim().ToLowerInvariant())
+        {
+            case "ping":
+                return new IpcResponse { Success = true, Message = "Monitor Profile Switcher is running." };
+
+            case "list-profiles":
+                _profileManager.Reload();
+                return new IpcResponse
+                {
+                    Success = true,
+                    Profiles = _profileManager.Profiles.Select(profile => new IpcProfile
+                    {
+                        Name = profile.Name,
+                        Topology = profile.IsNvidiaSurround ? "nvidia-surround" : profile.Monitors.Length > 1 ? "independent" : "single",
+                        Summary = profile.DisplaySummary,
+                        Hotkey = profile.Hotkey?.ToString(),
+                    }).ToArray(),
+                };
+
+            case "status":
+                return new IpcResponse
+                {
+                    Success = true,
+                    Status = IpcDisplayInspector.Capture().ToStatus(_profileManager.Profiles),
+                };
+
+            case "apply":
+                if (string.IsNullOrWhiteSpace(request.ProfileName) || request.ProfileName.Length > 256)
+                    return IpcResponse.Error("invalid_profile_name", "Specify a saved profile name of 1 to 256 characters.");
+                _profileManager.Reload();
+                var profile = _profileManager.GetProfile(request.ProfileName);
+                if (profile is null)
+                    return IpcResponse.Error("profile_not_found", $"Profile '{request.ProfileName}' was not found.");
+                return ApplyProfile(profile, "IPC");
+
+            default:
+                return IpcResponse.Error("unknown_command", $"Unknown IPC command '{request.Command}'.");
         }
     }
 

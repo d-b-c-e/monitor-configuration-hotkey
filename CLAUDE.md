@@ -23,6 +23,7 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - `NvidiaSurroundManager.cs` — Capture, validate, migrate, enable, and disable Surround grids
 - `ProfileManager.cs` — JSON serialization, CRUD for profiles
 - `TrayApplication.cs` — System tray icon, context menu, hotkey handling
+- `IpcService.cs` / `IpcDisplayInspector.cs` — Current-user named pipe, profile queries, and verified apply responses
 - `ManageProfilesDialog.cs` — Profile ordering, renaming, and hotkey management
 - `CaptureDialog.cs` / `HotkeyDialog.cs` — Capture and hotkey WinForms dialogs
 - `AppLog.cs` — Non-fatal rotating file diagnostics
@@ -31,6 +32,22 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - `DebugDump.cs` — Raw CCD path/mode diagnostics
 - `UpdateService.cs` — Rate-limited GitHub release checks and installer download
 - `scripts/release.ps1` / `installer/MonitorProfileSwitcher.iss` — Publish and installer pipeline
+
+## IPC integration
+
+The running tray instance listens on the current-user-only named pipe
+`\\.\pipe\MonitorProfileSwitcher_IPC`. The versioned JSON request/response contract, framing,
+time limits, and examples are in `docs/ipc.md`. External launchers should call `list-profiles`
+to select a saved profile, `status` to check the live topology, and `apply` before launching a
+game. An `apply` response reports success only after the live layout matches that profile.
+
+The built-in CLI client can exercise the pipe:
+
+```
+MonitorProfileSwitcher --ipc status
+MonitorProfileSwitcher --ipc list-profiles
+MonitorProfileSwitcher --ipc apply "Sim Racing Surround"
+```
 
 ## CLI Usage
 

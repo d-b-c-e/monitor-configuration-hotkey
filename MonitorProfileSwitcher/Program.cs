@@ -1,4 +1,6 @@
 using System.Threading;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace MonitorProfileSwitcher;
 
@@ -17,6 +19,12 @@ static class Program
             AppLog.Error("Unobserved task exception.", eventArgs.Exception);
             eventArgs.SetObserved();
         };
+
+        if (args.Length >= 2 && args[0].Equals("--ipc", StringComparison.OrdinalIgnoreCase))
+        {
+            RunIpcCliAsync(args).GetAwaiter().GetResult();
+            return;
+        }
 
         // CLI mode: mps capture "Profile Name" or mps apply "Profile Name"
         if (args.Length >= 2)
@@ -82,6 +90,42 @@ static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApplication());
+    }
+
+    private static async Task RunIpcCliAsync(string[] args)
+    {
+        var command = args[1].ToLowerInvariant();
+        if (command is not ("ping" or "status" or "list-profiles" or "apply") ||
+            (command == "apply" && args.Length != 3) ||
+            (command != "apply" && args.Length != 2))
+        {
+            Console.Error.WriteLine("Usage: MonitorProfileSwitcher --ipc ping|status|list-profiles|apply \"Profile Name\"");
+            Environment.ExitCode = 2;
+            return;
+        }
+
+        IpcResponse response;
+        try
+        {
+            response = await IpcService.SendAsync(new IpcRequest
+            {
+                Command = command,
+                ProfileName = command == "apply" ? args[2] : null,
+            });
+        }
+        catch (Exception ex)
+        {
+            AppLog.Error($"IPC CLI command '{command}' failed.", ex);
+            response = IpcResponse.Error("ipc_error", ex.Message);
+        }
+
+        Console.WriteLine(JsonSerializer.Serialize(response, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        }));
+        if (!response.Success)
+            Environment.ExitCode = 1;
     }
 
     private static void RunCli(string[] args)
@@ -150,6 +194,9 @@ static class Program
                 Console.Error.WriteLine("  MonitorProfileSwitcher --list                (list profiles)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --status              (show current config)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --validate-surround   (validate active NVIDIA Surround grid)");
+                Console.Error.WriteLine("  MonitorProfileSwitcher --ipc status          (query the running tray app over IPC)");
+                Console.Error.WriteLine("  MonitorProfileSwitcher --ipc list-profiles   (list profiles over IPC)");
+                Console.Error.WriteLine("  MonitorProfileSwitcher --ipc apply \"Name\"   (apply through the running tray app)");
                 Environment.Exit(1);
                 break;
         }
