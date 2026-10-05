@@ -3,6 +3,12 @@ using MonitorProfileSwitcher.Native;
 
 namespace MonitorProfileSwitcher;
 
+internal sealed class SurroundTransitionException : InvalidOperationException
+{
+    public SurroundTransitionException(string message) : base(message) { }
+    public SurroundTransitionException(string message, Exception inner) : base(message, inner) { }
+}
+
 internal static class NvidiaSurroundManager
 {
     private const uint ApplyWithBezelCorrectFlag = 1u << 0;
@@ -108,17 +114,47 @@ internal static class NvidiaSurroundManager
     }
 
     /// <summary>Disable Surround before handing the physical outputs back to Windows CCD.</summary>
-    public static bool DisableIfActive()
+    public static bool DisableIfActive(NvidiaSurroundConfig? recentlyObserved = null)
     {
         lock (Sync)
         {
             bool disabled = false;
             bool initialized = false;
+            bool windowsSurroundActive = false;
             try
             {
+                var windowsMonitors = DisplayManager.CaptureCurrentConfig().Monitors;
+                windowsSurroundActive = windowsMonitors.Any(monitor =>
+                    monitor.FriendlyName.Equals("NV Surround", StringComparison.OrdinalIgnoreCase));
+                var availableBefore = windowsSurroundActive
+                    ? DisplayManager.GetAvailableMonitorDevicePaths()
+                    : null;
+
                 NvApi.Initialize();
                 initialized = true;
                 var active = CaptureActiveCore();
+                if (active == null && windowsSurroundActive)
+                {
+                    // NVAPI and Windows can disagree briefly while the driver is rebuilding.
+                    // This exact disagreement previously let a Work Mode switch appear to
+                    // succeed while the three physical panels remained hidden.
+                    AppLog.Warn("NVAPI reports Surround inactive while Windows still exposes its logical monitor; retrying the driver state before applying CCD.");
+                    for (int attempt = 0; attempt < 4 && active == null; attempt++)
+                    {
+                        Thread.Sleep(250);
+                        active = CaptureActiveCore();
+                    }
+                    if (active == null && recentlyObserved != null)
+                    {
+                        Validate(recentlyObserved);
+                        active = recentlyObserved;
+                        AppLog.Warn("NVAPI still reports inactive; using the Surround grid observed at the start of this same switch for a guarded 1x1 transition.");
+                    }
+                    if (active == null)
+                        throw new SurroundTransitionException(
+                            "Windows still shows NVIDIA Surround, but NVIDIA did not report an active grid. " +
+                            "The switch was stopped before changing Windows display paths; open the logs and retry after the driver settles.");
+                }
                 if (active == null)
                 {
                     AppLog.Info("NVAPI reports Surround is already inactive; no driver transition needed.");
@@ -135,13 +171,20 @@ internal static class NvidiaSurroundManager
                 AppLog.Info("NVAPI accepted the direct 1x1 grid used to leave Surround.");
                 disabled = true;
                 WaitForState(expectedActive: false, expected: null);
+                if (availableBefore != null)
+                    WaitForPhysicalOutputs(availableBefore);
                 return true;
             }
-            catch (Exception ex) when (!disabled && IsUnavailable(ex))
+            catch (Exception ex) when (!disabled && !windowsSurroundActive && IsUnavailable(ex))
             {
                 // A normal Windows-only profile must continue to work on non-NVIDIA systems.
                 AppLog.Warn($"NVIDIA Surround disable check is unavailable; continuing with Windows CCD: {ex.Message}");
                 return false;
+            }
+            catch (Exception ex) when (windowsSurroundActive && ex is not SurroundTransitionException)
+            {
+                throw new SurroundTransitionException(
+                    "NVIDIA Surround did not safely return its physical displays. The Windows profile switch was stopped; see Open Logs for the driver error.", ex);
             }
             finally
             {
@@ -398,6 +441,34 @@ internal static class NvidiaSurroundManager
         string target = expectedActive ? "become active" : "turn off";
         AppLog.Error($"Timed out after {timeout.ElapsedMilliseconds}ms waiting for NVIDIA Surround to {target}.", lastError);
         throw new TimeoutException($"Timed out waiting for NVIDIA Surround to {target}.", lastError);
+    }
+
+    private static void WaitForPhysicalOutputs(HashSet<string> availableBefore)
+    {
+        var timeout = Stopwatch.StartNew();
+        Exception? lastError = null;
+        while (timeout.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            try
+            {
+                var availableNow = DisplayManager.GetAvailableMonitorDevicePaths();
+                var returned = availableNow.Except(availableBefore, StringComparer.OrdinalIgnoreCase).ToArray();
+                if (returned.Length > 0)
+                {
+                    AppLog.Info($"Windows enumerated {returned.Length} newly available physical display path(s) after leaving Surround in {timeout.ElapsedMilliseconds}ms: {string.Join(", ", returned)}.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+            Thread.Sleep(250);
+        }
+        throw new SurroundTransitionException(
+            "NVIDIA reported Surround inactive, but Windows did not rediscover any physical display paths. " +
+            "The switch was stopped before changing Windows display paths; see Open Logs for details.",
+            lastError ?? new TimeoutException("No physical displays appeared after the Surround transition."));
     }
 
     private static bool Matches(NvidiaSurroundConfig actual, NvidiaSurroundConfig expected) =>

@@ -12,10 +12,11 @@ Each request and response is one UTF-8 JSON object preceded by a 4-byte, little-
 signed length. This matches XOutputRedux's pipe framing. The server accepts at most 65,536
 request bytes; larger or incomplete frames are rejected. Responses are capped at 1,048,576
 bytes by the bundled CLI client. Each pipe connection carries one request and one response,
-then closes. The server handles one connection at a time, so commands are serialized with tray
-hotkeys and menu actions. A client should use a short connection timeout and allow up to 60
-seconds for an `apply` response; NVIDIA mode changes can take several seconds. A disconnect or
-timeout does not cancel a switch already in progress.
+then closes. The server accepts concurrent connections so `ping` and other requests are not
+held behind a slow display transition. Only one profile switch runs at a time; another `apply`
+gets a `busy` response. A client should use a short connection timeout and allow up to six
+minutes for an `apply` response; NVIDIA mode changes have occasionally taken several minutes.
+A disconnect or timeout does not cancel a switch already in progress.
 
 All requests include `protocolVersion: 1` and `command`. Property names are case-insensitive
 when read; responses use camel case. Unknown response fields may be ignored by clients.
@@ -71,10 +72,14 @@ logical monitors exposed by Windows, so a 1x3 Surround grid reports one monitor.
 `surroundRows` and `surroundColumns` fields identify the physical panel grid.
 
 On failure, `success` is false and `errorCode`/`message` explain the problem. Known codes
-include `profile_not_found`, `invalid_profile_name`, `apply_failed`, `unknown_command`,
+include `profile_not_found`, `invalid_profile_name`, `apply_failed`, `busy`, `unknown_command`,
 `unsupported_version`, and `command_failed`. A failed `apply` may leave Windows in an
 intermediate topology, so a launcher should refresh `status` and show the user the mismatch.
 The bundled CLI client also uses `not_running` and `ipc_error` for connection failures.
+
+Applying a profile that already matches the live layout is a verified no-op. If a display API
+reports an error after changing the layout, the switcher checks the full saved profile again
+and reports success only if it now matches; it does not blindly retry a driver transition.
 
 ## Bundled client
 

@@ -6,6 +6,8 @@ internal sealed class IpcDisplayInspector
     private readonly MonitorInfo[] _monitors;
     private readonly NvidiaSurroundConfig? _surround;
 
+    public NvidiaSurroundConfig? ActiveSurround => _surround;
+
     private IpcDisplayInspector(MonitorInfo[] monitors, NvidiaSurroundConfig? surround)
     {
         _monitors = monitors;

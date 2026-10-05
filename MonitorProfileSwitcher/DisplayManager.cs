@@ -76,7 +76,7 @@ internal static class DisplayManager
         };
     }
 
-    public static void ApplyProfile(DisplayProfile profile)
+    public static void ApplyProfile(DisplayProfile profile, NvidiaSurroundConfig? recentlyObservedSurround = null)
     {
         // Surround is created by the NVIDIA driver, below Windows CCD. A newly captured
         // profile carries the exact grid; a legacy "NV Surround" profile can still ask the
@@ -96,7 +96,7 @@ internal static class DisplayManager
 
         // CCD cannot split a Surround source into physical monitors. Give the outputs back to
         // Windows first, wait for the driver transition, then restore the saved Windows paths.
-        var surroundWasDisabled = NvidiaSurroundManager.DisableIfActive();
+        var surroundWasDisabled = NvidiaSurroundManager.DisableIfActive(recentlyObservedSurround);
         AppLog.Info($"Applying Windows display profile '{profile.Name}'. NVIDIA Surround transition required={surroundWasDisabled}.");
 
         // Query ALL paths (including inactive)
@@ -385,6 +385,22 @@ internal static class DisplayManager
             lines.Add($"    Path: {m.DevicePath}");
         }
         return string.Join(Environment.NewLine, lines);
+    }
+
+    /// <summary>Unique device paths currently available to Windows, including inactive paths.</summary>
+    public static HashSet<string> GetAvailableMonitorDevicePaths()
+    {
+        var (paths, _) = QueryConfig(
+            QueryDisplayConfigFlags.QDC_ALL_PATHS |
+            QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
+        var devicePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths)
+        {
+            var name = GetTargetDeviceName(path.targetInfo.adapterId, path.targetInfo.id);
+            if (!string.IsNullOrWhiteSpace(name.monitorDevicePath))
+                devicePaths.Add(name.monitorDevicePath);
+        }
+        return devicePaths;
     }
 
     private static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) QueryConfig(

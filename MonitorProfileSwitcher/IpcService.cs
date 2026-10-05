@@ -25,7 +25,7 @@ internal sealed class IpcService : IDisposable
 
     private readonly Func<IpcRequest, Task<IpcResponse>> _dispatch;
     private readonly CancellationTokenSource _shutdown = new();
-    private NamedPipeServerStream? _activePipe;
+    private NamedPipeServerStream? _pendingPipe;
     private Task? _serverTask;
     private bool _disposed;
 
@@ -41,17 +41,22 @@ internal sealed class IpcService : IDisposable
     {
         while (!_shutdown.IsCancellationRequested)
         {
+            NamedPipeServerStream? pipe = null;
             try
             {
-                using var pipe = new NamedPipeServerStream(
+                pipe = new NamedPipeServerStream(
                     PipeName,
                     PipeDirection.InOut,
-                    1,
+                    NamedPipeServerStream.MaxAllowedServerInstances,
                     PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-                _activePipe = pipe;
+                _pendingPipe = pipe;
                 await pipe.WaitForConnectionAsync(_shutdown.Token);
-                await HandleClientAsync(pipe);
+                _pendingPipe = null;
+                // A display apply may spend minutes in the driver. Keep accepting ping,
+                // status, and other requests while that client's response is pending.
+                _ = HandleClientAndDisposeAsync(pipe);
+                pipe = null;
             }
             catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
             {
@@ -68,11 +73,19 @@ internal sealed class IpcService : IDisposable
             }
             finally
             {
-                _activePipe = null;
+                if (ReferenceEquals(_pendingPipe, pipe))
+                    _pendingPipe = null;
+                pipe?.Dispose();
             }
         }
 
         AppLog.Info("IPC server stopped.");
+    }
+
+    private async Task HandleClientAndDisposeAsync(NamedPipeServerStream pipe)
+    {
+        using (pipe)
+            await HandleClientAsync(pipe);
     }
 
     private async Task HandleClientAsync(NamedPipeServerStream pipe)
@@ -138,7 +151,9 @@ internal sealed class IpcService : IDisposable
         }
 
         using var responseTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        responseTimeout.CancelAfter(TimeSpan.FromSeconds(60));
+        responseTimeout.CancelAfter(request.Command?.Equals("apply", StringComparison.OrdinalIgnoreCase) == true
+            ? TimeSpan.FromMinutes(6)
+            : TimeSpan.FromSeconds(60));
         await WriteFrameAsync(client, request, responseTimeout.Token);
         return await ReadFrameAsync<IpcResponse>(client, MaxResponseBytes, responseTimeout.Token)
             ?? IpcResponse.Error("invalid_response", "The IPC response was empty.");
@@ -172,7 +187,7 @@ internal sealed class IpcService : IDisposable
         if (_disposed) return;
         _disposed = true;
         _shutdown.Cancel();
-        _activePipe?.Dispose();
+        _pendingPipe?.Dispose();
     }
 }
 
