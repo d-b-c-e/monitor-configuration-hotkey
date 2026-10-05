@@ -37,12 +37,47 @@ internal class ProfileManager
 
         var json = File.ReadAllText(ProfilePath);
         _store = JsonSerializer.Deserialize<ProfileStore>(json, JsonOptions) ?? new ProfileStore();
+        // Older profiles have no ID. Layout snapshots need an identity that survives
+        // renaming; persist the migration once rather than keying them by name.
+        if (_store.Profiles.Any(profile => string.IsNullOrWhiteSpace(profile.Id)))
+        {
+            foreach (var profile in _store.Profiles.Where(profile => string.IsNullOrWhiteSpace(profile.Id)))
+                profile.Id = Guid.NewGuid().ToString("N");
+            Save();
+        }
         AppLog.Info($"Loaded {_store.Profiles.Count} profile(s) from {ProfilePath}.");
     }
 
     /// <summary>Re-read profiles.json from disk, discarding the in-memory copy. Use when the
     /// file may have changed outside the app (manual edit, restore from backup, sync).</summary>
     public void Reload() => Load();
+
+    /// <summary>Persist an inferred legacy Surround grid without overwriting profile edits
+    /// made by another process while the slow driver transition was in progress.</summary>
+    public void SaveMigratedSurroundGrid(DisplayProfile appliedProfile)
+    {
+        if (appliedProfile.NvidiaSurround == null)
+            return;
+
+        try
+        {
+            Reload();
+            var current = GetProfile(appliedProfile.Name);
+            if (current == null || current.CapturedAt != appliedProfile.CapturedAt || current.NvidiaSurround != null)
+            {
+                AppLog.Warn($"Skipped persisting inferred Surround grid for '{appliedProfile.Name}' because the saved profile changed during the switch.");
+                return;
+            }
+
+            current.NvidiaSurround = appliedProfile.NvidiaSurround;
+            Save();
+        }
+        catch (Exception ex)
+        {
+            // The live switch can be successful even if metadata migration cannot be saved.
+            AppLog.Warn($"Could not persist inferred Surround grid for '{appliedProfile.Name}': {ex.Message}");
+        }
+    }
 
     public void Save()
     {
@@ -59,6 +94,8 @@ internal class ProfileManager
         var snapshot = DisplayManager.CaptureCurrentConfig();
         var profile = new DisplayProfile
         {
+            Id = _store.Profiles.FirstOrDefault(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Id
+                ?? Guid.NewGuid().ToString("N"),
             Name = name,
             Hotkey = hotkey,
             Monitors = snapshot.Monitors,

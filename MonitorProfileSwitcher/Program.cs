@@ -138,6 +138,46 @@ static class Program
 
         switch (command)
         {
+            case "layout":
+                if (name.Equals("save", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!WindowLayoutManager.SaveCurrentLayout(pm.Profiles))
+                    {
+                        Console.Error.WriteLine("No eligible windows or unique active profile; layout was not saved.");
+                        Environment.ExitCode = 1;
+                    }
+                    else
+                        Console.WriteLine("Saved the active profile's window layout.");
+                }
+                else if (name.Equals("restore", StringComparison.OrdinalIgnoreCase))
+                {
+                    var result = WindowLayoutManager.RestoreCurrentLayout(pm.Profiles);
+                    if (result == null)
+                    {
+                        Console.Error.WriteLine("No saved layout for the active profile.");
+                        Environment.ExitCode = 1;
+                    }
+                    else
+                        Console.WriteLine($"Restored {result.Restored} window(s) for '{result.ProfileName}' (missing={result.Missing}, offscreen={result.Offscreen}, failed={result.Failed}).");
+                }
+                else if (name.Equals("enable", StringComparison.OrdinalIgnoreCase) ||
+                         name.Equals("disable", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool enabled = name.Equals("enable", StringComparison.OrdinalIgnoreCase);
+                    WindowLayoutManager.SetEnabled(enabled);
+                    Console.WriteLine($"Automatic window-layout restore {(enabled ? "enabled" : "disabled")}.");
+                }
+                else if (name.Equals("status", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"Automatic window-layout restore is {(WindowLayoutManager.IsEnabled() ? "enabled" : "disabled")}.");
+                }
+                else
+                {
+                    Console.Error.WriteLine("Usage: MonitorProfileSwitcher layout save|restore|enable|disable|status");
+                    Environment.ExitCode = 2;
+                }
+                break;
+
             case "capture":
                 AppLog.Info($"CLI capture requested for profile '{name}'.");
                 HotkeyBinding? hotkey = null;
@@ -154,7 +194,6 @@ static class Program
 
             case "apply":
                 var operationId = Guid.NewGuid().ToString("N")[..8];
-                AppLog.Info($"[{operationId}] CLI apply requested for profile '{name}'. Before:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
                 var target = pm.GetProfile(name);
                 if (target == null)
                 {
@@ -164,15 +203,15 @@ static class Program
                 try
                 {
                     bool legacySurround = target.IsNvidiaSurround && target.NvidiaSurround == null;
-                    DisplayManager.ApplyProfile(target);
+                    var outcome = ProfileApplyRunner.Apply(target, pm.Profiles, operationId, "direct CLI");
                     if (legacySurround && target.NvidiaSurround != null)
-                        pm.Save();
-                    AppLog.Info($"[{operationId}] CLI apply completed for profile '{name}'. After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
-                    Console.WriteLine($"Applied '{name}'");
+                        pm.SaveMigratedSurroundGrid(target);
+                    Console.WriteLine(outcome == ProfileApplyOutcome.AlreadyActive
+                        ? $"'{name}' is already active"
+                        : $"Applied and verified '{name}'");
                 }
                 catch (Exception ex)
                 {
-                    AppLog.Error($"[{operationId}] CLI apply failed for profile '{name}'. Current state:{Environment.NewLine}{SafeDescribeCurrentConfig()}", ex);
                     Console.Error.WriteLine($"Failed: {ex.Message}");
                     Environment.Exit(1);
                 }
@@ -197,15 +236,10 @@ static class Program
                 Console.Error.WriteLine("  MonitorProfileSwitcher --ipc status          (query the running tray app over IPC)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --ipc list-profiles   (list profiles over IPC)");
                 Console.Error.WriteLine("  MonitorProfileSwitcher --ipc apply \"Name\"   (apply through the running tray app)");
+                Console.Error.WriteLine("  MonitorProfileSwitcher layout save|restore|enable|disable|status");
                 Environment.Exit(1);
                 break;
         }
-    }
-
-    private static string SafeDescribeCurrentConfig()
-    {
-        try { return DisplayManager.DescribeCurrentConfig(); }
-        catch (Exception ex) { return $"Unable to read current display configuration: {ex.Message}"; }
     }
 
     private static HotkeyBinding? ParseHotkeyArg(string arg)

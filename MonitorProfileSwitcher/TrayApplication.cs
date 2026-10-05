@@ -19,6 +19,7 @@ internal class TrayApplication : ApplicationContext
     private System.Windows.Forms.Timer? _hotkeyRetry;
     private Control? _ipcDispatchControl;
     private IpcService? _ipcService;
+    private int _applyInProgress;
 
     /// <summary>Profiles whose hotkey would not register, retried until they do or we give up.</summary>
     private readonly List<DisplayProfile> _failedHotkeys = new();
@@ -74,7 +75,7 @@ internal class TrayApplication : ApplicationContext
                 var hotkeyText = profile.Hotkey != null ? $"  ({profile.Hotkey})" : "";
                 var item = menu.Items.Add(
                     $"{profile.Name}{hotkeyText}  [{profile.DisplaySummary}]");
-                item.Click += (_, _) => ApplyProfile(profile, "tray menu");
+                item.Click += async (_, _) => await ApplyProfileAsync(profile, "tray menu");
             }
             menu.Items.Add(new ToolStripSeparator());
         }
@@ -88,6 +89,77 @@ internal class TrayApplication : ApplicationContext
         {
             var manageItem = menu.Items.Add("Manage Profiles...");
             manageItem.Click += (_, _) => ManageProfiles();
+
+            var rememberWindows = new ToolStripMenuItem("Remember Window Layouts")
+            {
+                Checked = WindowLayoutManager.IsEnabled(),
+                CheckOnClick = false,
+            };
+            rememberWindows.Click += (_, _) =>
+            {
+                try
+                {
+                    var enabled = !WindowLayoutManager.IsEnabled();
+                    WindowLayoutManager.SetEnabled(enabled);
+                    rememberWindows.Checked = enabled;
+                    ShowBalloon(enabled
+                        ? "Window layouts will be saved when leaving each profile and restored when returning."
+                        : "Automatic window-layout restore is off.");
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("Could not change window-layout setting.", ex);
+                    ShowBalloon($"Could not change window-layout setting: {ex.Message}", ToolTipIcon.Error);
+                }
+            };
+            menu.Items.Add(rememberWindows);
+
+            var saveWindowLayout = menu.Items.Add("Save Current Window Layout");
+            saveWindowLayout.Click += (_, _) =>
+            {
+                try
+                {
+                    if (Volatile.Read(ref _applyInProgress) != 0)
+                    {
+                        ShowBalloon("Wait for the profile switch to finish before saving a window layout.", ToolTipIcon.Warning);
+                        return;
+                    }
+                    _profileManager.Reload();
+                    ShowBalloon(WindowLayoutManager.SaveCurrentLayout(_profileManager.Profiles)
+                        ? "Window layout saved for the active profile."
+                        : "No eligible windows or unique active profile; layout was not saved.",
+                        ToolTipIcon.Info);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("Could not save current window layout.", ex);
+                    ShowBalloon($"Could not save window layout: {ex.Message}", ToolTipIcon.Error);
+                }
+            };
+
+            var restoreWindowLayout = menu.Items.Add("Restore Saved Window Layout");
+            restoreWindowLayout.Click += (_, _) =>
+            {
+                try
+                {
+                    if (Volatile.Read(ref _applyInProgress) != 0)
+                    {
+                        ShowBalloon("Wait for the profile switch to finish before restoring a window layout.", ToolTipIcon.Warning);
+                        return;
+                    }
+                    _profileManager.Reload();
+                    var result = WindowLayoutManager.RestoreCurrentLayout(_profileManager.Profiles);
+                    ShowBalloon(result == null
+                        ? "No saved layout for the active profile."
+                        : $"Restored {result.Restored} window(s) for '{result.ProfileName}'.",
+                        result == null ? ToolTipIcon.Warning : ToolTipIcon.Info);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("Could not restore the saved window layout.", ex);
+                    ShowBalloon($"Could not restore window layout: {ex.Message}", ToolTipIcon.Error);
+                }
+            };
 
             var actionsMenu = new ToolStripMenuItem("Profile Actions");
             foreach (var profile in _profileManager.Profiles)
@@ -212,10 +284,17 @@ internal class TrayApplication : ApplicationContext
         }
     }
 
-    private IpcResponse ApplyProfile(DisplayProfile profile, string trigger)
+    private async Task<IpcResponse> ApplyProfileAsync(DisplayProfile profile, string trigger)
     {
+        if (Interlocked.CompareExchange(ref _applyInProgress, 1, 0) != 0)
+        {
+            AppLog.Warn($"Rejected overlapping apply request for '{profile.Name}' from {trigger}.");
+            if (trigger != "IPC")
+                ShowBalloon("A profile switch is already in progress.", ToolTipIcon.Warning);
+            return IpcResponse.Error("busy", "A display profile switch is already in progress. Wait for it to finish before trying another.");
+        }
+
         var operationId = Guid.NewGuid().ToString("N")[..8];
-        var started = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             // Re-read profiles.json from disk first: this instance loaded profiles at
@@ -224,29 +303,50 @@ internal class TrayApplication : ApplicationContext
             _profileManager.Reload();
             var fresh = _profileManager.GetProfile(profile.Name) ??
                 throw new InvalidOperationException($"Profile '{profile.Name}' no longer exists.");
-            AppLog.Info($"[{operationId}] Apply started. Profile='{fresh.Name}' Trigger='{trigger}' Type='{fresh.DisplaySummary}' Before:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
             bool legacySurround = fresh.IsNvidiaSurround && fresh.NvidiaSurround == null;
-            DisplayManager.ApplyProfile(fresh);
+            // Native display calls can block for minutes while the driver rebuilds its
+            // topology. Keep the tray message loop alive and reject overlapping applies.
+            var outcome = await Task.Run(() => ProfileApplyRunner.Apply(fresh, _profileManager.Profiles, operationId, trigger));
             if (legacySurround && fresh.NvidiaSurround != null)
-                _profileManager.Save();
-            var inspector = IpcDisplayInspector.Capture();
+                _profileManager.SaveMigratedSurroundGrid(fresh);
+            var inspector = await Task.Run(IpcDisplayInspector.Capture);
             if (!inspector.Matches(fresh))
                 throw new InvalidOperationException("The driver finished the switch, but the live display layout does not match the saved profile. See Open Logs for details.");
             var status = inspector.ToStatus(_profileManager.Profiles);
-            AppLog.Info($"[{operationId}] Apply completed in {started.ElapsedMilliseconds}ms. Profile='{fresh.Name}' After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
-            ShowBalloon($"Switched to '{fresh.Name}'");
+            ShowBalloon(outcome == ProfileApplyOutcome.AlreadyActive
+                ? $"'{fresh.Name}' is already active"
+                : $"Switched to '{fresh.Name}'");
             return new IpcResponse
             {
                 Success = true,
-                Message = $"Applied and verified profile '{fresh.Name}'.",
+                Message = outcome switch
+                {
+                    ProfileApplyOutcome.AlreadyActive => $"Profile '{fresh.Name}' was already active and verified.",
+                    ProfileApplyOutcome.VerifiedAfterApiError => $"Applied and verified profile '{fresh.Name}' despite a display API error; see logs.",
+                    _ => $"Applied and verified profile '{fresh.Name}'.",
+                },
                 OperationId = operationId,
                 ProfileName = fresh.Name,
                 Status = status,
             };
         }
+        catch (ProfileApplyBusyException ex)
+        {
+            AppLog.Warn($"[{operationId}] Apply rejected because another process is switching profiles.");
+            if (trigger != "IPC")
+                ShowBalloon(ex.Message, ToolTipIcon.Warning);
+            return new IpcResponse
+            {
+                Success = false,
+                ErrorCode = "busy",
+                Message = ex.Message,
+                OperationId = operationId,
+                ProfileName = profile.Name,
+            };
+        }
         catch (Exception ex)
         {
-            AppLog.Error($"[{operationId}] Apply failed after {started.ElapsedMilliseconds}ms. Profile='{profile.Name}' Current state:{Environment.NewLine}{SafeDescribeCurrentConfig()}", ex);
+            AppLog.Error($"[{operationId}] Tray apply failed for '{profile.Name}'.", ex);
             ShowBalloon($"Failed: {ex.Message}", ToolTipIcon.Error);
             return new IpcResponse
             {
@@ -256,6 +356,10 @@ internal class TrayApplication : ApplicationContext
                 OperationId = operationId,
                 ProfileName = profile.Name,
             };
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _applyInProgress, 0);
         }
     }
 
@@ -279,9 +383,9 @@ internal class TrayApplication : ApplicationContext
         var completion = new TaskCompletionSource<IpcResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
-            _ipcDispatchControl!.BeginInvoke(new Action(() =>
+            _ipcDispatchControl!.BeginInvoke(new Action(async () =>
             {
-                try { completion.SetResult(HandleIpcRequest(request)); }
+                try { completion.SetResult(await HandleIpcRequestAsync(request)); }
                 catch (Exception ex)
                 {
                     AppLog.Error($"IPC command '{request.Command}' failed.", ex);
@@ -296,7 +400,7 @@ internal class TrayApplication : ApplicationContext
         return completion.Task;
     }
 
-    private IpcResponse HandleIpcRequest(IpcRequest request)
+    private async Task<IpcResponse> HandleIpcRequestAsync(IpcRequest request)
     {
         switch (request.Command?.Trim().ToLowerInvariant())
         {
@@ -321,7 +425,7 @@ internal class TrayApplication : ApplicationContext
                 return new IpcResponse
                 {
                     Success = true,
-                    Status = IpcDisplayInspector.Capture().ToStatus(_profileManager.Profiles),
+                    Status = (await Task.Run(IpcDisplayInspector.Capture)).ToStatus(_profileManager.Profiles),
                 };
 
             case "apply":
@@ -331,7 +435,7 @@ internal class TrayApplication : ApplicationContext
                 var profile = _profileManager.GetProfile(request.ProfileName);
                 if (profile is null)
                     return IpcResponse.Error("profile_not_found", $"Profile '{request.ProfileName}' was not found.");
-                return ApplyProfile(profile, "IPC");
+                return await ApplyProfileAsync(profile, "IPC");
 
             default:
                 return IpcResponse.Error("unknown_command", $"Unknown IPC command '{request.Command}'.");
@@ -595,11 +699,11 @@ internal class TrayApplication : ApplicationContext
         _nextHotkeyId = 1;
     }
 
-    private void OnHotkeyPressed(int hotkeyId)
+    private async void OnHotkeyPressed(int hotkeyId)
     {
         if (_hotkeyMap.TryGetValue(hotkeyId, out var profile))
         {
-            ApplyProfile(profile, $"hotkey {profile.Hotkey}");
+            await ApplyProfileAsync(profile, $"hotkey {profile.Hotkey}");
         }
     }
 
@@ -650,12 +754,6 @@ internal class TrayApplication : ApplicationContext
         _trayIcon.BalloonTipText = text;
         _trayIcon.BalloonTipIcon = icon;
         _trayIcon.ShowBalloonTip(3000);
-    }
-
-    private static string SafeDescribeCurrentConfig()
-    {
-        try { return DisplayManager.DescribeCurrentConfig(); }
-        catch (Exception ex) { return $"Unable to read current display configuration: {ex.Message}"; }
     }
 
     private static Icon LoadEmbeddedIcon()

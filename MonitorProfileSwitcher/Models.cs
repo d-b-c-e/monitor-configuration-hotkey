@@ -5,6 +5,7 @@ namespace MonitorProfileSwitcher;
 
 internal class DisplayProfile
 {
+    public string Id { get; set; } = "";
     public string Name { get; set; } = "";
     public HotkeyBinding? Hotkey { get; set; }
     public MonitorInfo[] Monitors { get; set; } = [];
