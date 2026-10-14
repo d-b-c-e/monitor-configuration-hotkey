@@ -203,12 +203,14 @@ static class Program
                 try
                 {
                     bool legacySurround = target.IsNvidiaSurround && target.NvidiaSurround == null;
-                    var outcome = ProfileApplyRunner.Apply(target, pm.Profiles, operationId, "direct CLI");
+                    var result = ProfileApplyRunner.Apply(target, pm.Profiles, operationId, "direct CLI");
                     if (legacySurround && target.NvidiaSurround != null)
                         pm.SaveMigratedSurroundGrid(target);
-                    Console.WriteLine(outcome == ProfileApplyOutcome.AlreadyActive
+                    Console.WriteLine(result.Outcome == ProfileApplyOutcome.AlreadyActive
                         ? $"'{name}' is already active"
                         : $"Applied and verified '{name}'");
+                    if (result.SkippedMonitors.Count > 0)
+                        Console.WriteLine($"Not connected, skipped: {string.Join(", ", result.SkippedMonitors.Select(m => m.FriendlyName.Length > 0 ? m.FriendlyName : m.EdidId))}");
                 }
                 catch (Exception ex)
                 {

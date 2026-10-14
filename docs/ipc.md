@@ -66,6 +66,14 @@ be found in `%LOCALAPPDATA%\MonitorProfileSwitcher\logs\app.log`.
 {"protocolVersion":1,"success":true,"message":"Applied and verified profile 'Sim Racing Surround'.","operationId":"a1b2c3d4","profileName":"Sim Racing Surround","status":{"topology":"nvidia-surround","monitorCount":1,"desktopWidth":7680,"desktopHeight":1440,"activeProfileName":"Sim Racing Surround","surroundRows":1,"surroundColumns":3,"monitors":[{"name":"NV Surround","width":7680,"height":1440,"x":0,"y":0,"primary":true}]}}
 ```
 
+If some of the profile's monitors are not connected (unplugged, or swapped for another monitor
+on the same cable), `apply` still succeeds with the connected ones: the rest of the layout is
+closed up, a new primary is chosen if the saved one is missing, and the response carries
+`"skippedMonitors": ["MPG 491C OLED"]` (names use the user's nicknames where set). The field is
+absent when nothing was skipped. A profile with none of its monitors connected fails with
+`apply_failed`. The NVIDIA Surround desktop is never "missing": it only exists once its grid is
+enabled.
+
 Topology values are `nvidia-surround`, `independent` (two or more separate active Windows
 monitors), and `single` (one non-Surround Windows monitor). `monitorCount` is the number of
 logical monitors exposed by Windows, so a 1x3 Surround grid reports one monitor. The optional

@@ -54,42 +54,52 @@ internal sealed class IpcDisplayInspector
         };
     }
 
-    public bool Matches(DisplayProfile profile)
+    public bool Matches(DisplayProfile profile) => Mismatch(profile) == null;
+
+    /// <summary>Null when the live layout matches <paramref name="profile"/>; otherwise the first
+    /// difference, in words, so a failed verification says what was actually wrong.</summary>
+    public string? Mismatch(DisplayProfile profile)
     {
         if (profile.IsNvidiaSurround)
         {
             var saved = profile.NvidiaSurround;
             if (_surround is null || saved is null)
-                return false;
+                return _surround is null ? "NVIDIA Surround is not active" : "the profile has no Surround grid saved";
             if (_surround.Rows != saved.Rows || _surround.Columns != saved.Columns ||
                 _surround.WidthPerDisplay != saved.WidthPerDisplay ||
                 _surround.HeightPerDisplay != saved.HeightPerDisplay ||
                 !_surround.Displays.Select(display => display.DisplayId)
                     .SequenceEqual(saved.Displays.Select(display => display.DisplayId)))
-                return false;
+                return $"the active Surround grid is {_surround.Rows}x{_surround.Columns}, not the saved {saved.Rows}x{saved.Columns} grid";
         }
         else if (_surround is not null)
         {
-            return false;
+            return "NVIDIA Surround is still active";
         }
-
-        if (_monitors.Length != profile.Monitors.Length)
-            return false;
 
         var currentByPath = _monitors.ToDictionary(monitor => monitor.DevicePath, StringComparer.OrdinalIgnoreCase);
         foreach (var saved in profile.Monitors)
         {
+            var name = Describe(saved);
             if (!currentByPath.TryGetValue(saved.DevicePath, out var current))
-                return false;
-            if (saved.IsPrimary != current.IsPrimary ||
-                saved.Position.X != current.Position.X || saved.Position.Y != current.Position.Y ||
-                saved.Resolution.Width != current.Resolution.Width ||
-                saved.Resolution.Height != current.Resolution.Height ||
-                saved.Rotation != current.Rotation ||
-                (saved.RefreshRate.IsSpecified && !saved.RefreshRate.Matches(current.RefreshRate.ToRational())))
-                return false;
+                return $"{name} is not on";
+            if (saved.IsPrimary != current.IsPrimary)
+                return $"{name} is {(current.IsPrimary ? "" : "not ")}the main display";
+            if (saved.Position.X != current.Position.X || saved.Position.Y != current.Position.Y)
+                return $"{name} is at ({current.Position.X},{current.Position.Y}), not ({saved.Position.X},{saved.Position.Y})";
+            if (saved.Resolution.Width != current.Resolution.Width || saved.Resolution.Height != current.Resolution.Height)
+                return $"{name} is {current.Resolution.Width}x{current.Resolution.Height}, not {saved.Resolution.Width}x{saved.Resolution.Height}";
+            if (saved.Rotation != current.Rotation)
+                return $"{name} is rotated {current.Rotation}, not {saved.Rotation}";
+            if (saved.RefreshRate.IsSpecified && !saved.RefreshRate.Matches(current.RefreshRate.ToRational()))
+                return $"{name} is at {current.RefreshRate}, not {saved.RefreshRate}";
         }
 
-        return true;
+        var wanted = new HashSet<string>(profile.Monitors.Select(monitor => monitor.DevicePath), StringComparer.OrdinalIgnoreCase);
+        var extra = _monitors.Where(monitor => !wanted.Contains(monitor.DevicePath)).ToList();
+        return extra.Count > 0 ? $"{string.Join(", ", extra.Select(Describe))} should be off" : null;
     }
+
+    private static string Describe(MonitorInfo monitor) =>
+        monitor.FriendlyName.Length > 0 ? monitor.FriendlyName : monitor.EdidId;
 }

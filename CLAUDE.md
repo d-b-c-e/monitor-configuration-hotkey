@@ -25,7 +25,14 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - `TrayApplication.cs` — System tray icon, context menu, hotkey handling
 - `IpcService.cs` / `IpcDisplayInspector.cs` — Current-user named pipe, profile queries, and verified apply responses
 - `ManageProfilesDialog.cs` — Profile ordering, renaming, deletion, and hotkey management (all staged until Save)
-- `CaptureDialog.cs` / `HotkeyDialog.cs` — Capture and hotkey WinForms dialogs
+- `CaptureDialog.cs` / `HotkeyDialog.cs` — Capture/save-as-profile (overwrite keeps the hotkey, refuses duplicate hotkeys) and hotkey dialogs
+- `ArrangeDisplaysForm.cs` — Arrange Displays window: stage arrangement/enable/primary/mode/rotation edits, apply in one operation, keep-or-revert, save as profile
+- `DisplayCanvas.cs` — The drag-and-snap arrangement view and the "not in use" strip
+- `ArrangementModel.cs` — Editor model (`ArrangedMonitor`), change detection, editor → `DisplayProfile`
+- `DisplayInventory.cs` — Every connected output (on or off): adapter, connector, preferred mode, GDI mode list
+- `MonitorLibrary.cs` — `monitors.json`: every monitor ever seen, nicknames, last placement, modes, exact refresh rationals
+- `DisplayLayout.cs` — Layout geometry: snapping/attaching, closing gaps, primary at (0,0), dropping unplugged monitors from a profile
+- `ScreenPrompts.cs` — Keep-changes prompt on every screen; Identify numbers
 - `AppLog.cs` — Non-fatal rotating file diagnostics
 - `Models.cs` — Data models for profiles, monitors, hotkeys
 - `Program.cs` — Entry point with CLI and tray modes
@@ -62,6 +69,52 @@ MonitorProfileSwitcher delete "Name"        # delete a profile
 MonitorProfileSwitcher --list               # list saved profiles
 ```
 
+## Arrange Displays (1.1.0)
+
+Tray → **Arrange Displays...** (or double-click the tray icon). Built because Windows' own
+page loses monitors until reopened, applies one monitor at a time with a 15s confirm each, and
+puts that confirm on a single screen that is easy to lose.
+
+- Every edit is staged; **Apply** builds one `DisplayProfile` from the editor and runs it through
+  `ProfileApplyRunner` like any profile (busy mutex, topology + layout passes, live verification).
+  Window-layout capture/restore is skipped for editor applies (`manageWindowLayouts: false`).
+- The keep prompt appears on every screen, takes Enter/Esc, and reverts after 15s by applying a
+  snapshot taken just before. It can be switched off ("Ask to keep changes", in `monitors.json`).
+- The window re-reads displays on `WM_DISPLAYCHANGE`/`WM_DEVICECHANGE` (debounced 1.2s). With
+  unapplied edits it keeps them and only updates what is connected.
+- `MonitorLibrary` remembers every monitor (seeded from profiles); device paths encode the port,
+  so the same monitor on another port is a different entry. NV Surround entries are hidden while
+  Surround is off, and the panels of an active Surround show in the strip as "In NVIDIA Surround".
+- **Disabling keeps the layout.** A switched-off connected monitor stays in the layout as a dashed
+  tile where it was; nothing else moves. Re-enabling (right-click, checkbox) attaches it at the same
+  spot if that still touches a neighbour. Apply closes any gap Windows needs closed.
+- **Usual places (`HomePosition`).** Separate from `LastPosition` (wherever Windows last had it,
+  overwritten on every observation), the usual place is set only by the user: a kept editor Apply
+  (live layout plus the off/unplugged monitors' spots), a successful profile switch from the tray,
+  hotkey or IPC, or dragging an off/unplugged monitor. Windows renumbers coordinates whenever the
+  main display changes, so usual places are mapped to live ones with the shift most active monitors
+  agree on (`HomeOffset`), and every record re-bases the others so all stay in one frame.
+  Unplugged monitors with a usual place are dotted outlines there (two monitors sharing one cable
+  share one spot); ones never placed wait in the strip to be dragged into place. When an active
+  monitor is away from its usual place, **Restore usual places** stages moving it back.
+- **Delete monitor** (right-click / side panel) forgets name, usual place, modes and rates. Profiles
+  are untouched; a connected monitor reappears immediately as a fresh entry.
+- The tray and the window share one `MonitorLibrary` instance so neither overwrites the other.
+- **Refresh rates:** GDI lists whole hertz, but verification compares the exact CCD rational. A
+  rate picked from the list uses the exact rational last seen for that resolution
+  (`ExactRates`), or else an `IsApproximate` rate that matches within 0.5 Hz. Never persisted.
+- **Surround in the editor:** the live Surround desktop is one tile (position only; its mode is the
+  grid's). Removing it from the layout turns Surround off. Creating a new grid is not in the editor
+  yet; profiles still switch Surround on.
+
+## Unplugged monitors in a profile (1.1.0)
+
+`DisplayLayout.WithoutMissingMonitors` runs before every apply: monitors that are not connected
+are skipped instead of failing the switch, a new primary is picked if needed (nearest the old
+origin), and the remaining displays are pulled together so none float free. The tray balloon and
+the IPC response (`skippedMonitors`) name what was left out. The Surround desktop is never treated
+as missing. A profile with none of its monitors connected still fails as before.
+
 ## NVIDIA Surround
 
 - Surround is a driver topology, not a Windows CCD topology. The app uses the public NVAPI
@@ -74,6 +127,13 @@ MonitorProfileSwitcher --list               # list saved profiles
   physical outputs to return, then runs the existing CCD apply. The older topology-toggle disable
   call is deliberately avoided because current GeForce drivers can return `MODE_CHANGE_FAILED`
   and display an NVIDIA error popup even when a fallback subsequently succeeds.
+- **Enabling Surround switches every other display off** — even ones on another adapter (a
+  DisplayLink USB panel stays connected but inactive). A Surround profile that saved extra
+  monitors (e.g. a diagnostics screen above the triples) therefore restores its Windows layout on
+  top of the grid: after the grid is up it waits for every saved monitor to be available, then
+  runs the normal CCD topology + layout pass. If the grid is already live, the grid rebuild is
+  skipped and only the Windows layout is applied. The wait guarantees a topology is never
+  supplied without the Surround desktop in it.
 - Profiles captured before this support are recognized by their single `NV Surround` monitor.
   On first apply, the app infers a matching horizontal/vertical grid from active NVIDIA 1x1
   displays, enables it, and upgrades the profile in `profiles.json`. If the panel dimensions do
@@ -161,7 +221,7 @@ hotkeys at all.
 
 **Working**: CCD capture/apply, monitor enable/disable, position, primary display, resolution,
 rotation, refresh rate, NVIDIA Surround ↔ independent-monitor switching, profile persistence and
-legacy migration, profile ordering/renaming/deletion/hotkey management, rotating switch diagnostics, tray UI,
+legacy migration, profile ordering/renaming/deletion/hotkey management, Arrange Displays editor (single-step apply, keep-or-revert, monitor memory), skipping unplugged monitors, rotating switch diagnostics, tray UI,
 global hotkeys with retry/error reporting, CLI diagnostics, and updater.
 
 The 1x3 Surround → three independent displays → 1x3 Surround round trip was exercised on a

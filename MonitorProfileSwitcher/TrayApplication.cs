@@ -20,6 +20,8 @@ internal class TrayApplication : ApplicationContext
     private Control? _ipcDispatchControl;
     private IpcService? _ipcService;
     private int _applyInProgress;
+    private ArrangeDisplaysForm? _arrangeForm;
+    private MonitorLibrary? _library;
 
     /// <summary>Profiles whose hotkey would not register, retried until they do or we give up.</summary>
     private readonly List<DisplayProfile> _failedHotkeys = new();
@@ -44,6 +46,11 @@ internal class TrayApplication : ApplicationContext
         {
             if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
                 RebuildContextMenu();
+        };
+        _trayIcon.MouseDoubleClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left)
+                OpenArrangeDisplays();
         };
 
         RebuildContextMenu();
@@ -79,6 +86,10 @@ internal class TrayApplication : ApplicationContext
             }
             menu.Items.Add(new ToolStripSeparator());
         }
+
+        var arrangeItem = menu.Items.Add("Arrange Displays...");
+        arrangeItem.Font = new Font(arrangeItem.Font, FontStyle.Bold);
+        arrangeItem.Click += (_, _) => OpenArrangeDisplays();
 
         // Capture
         var captureItem = menu.Items.Add("Capture Current Setup As...");
@@ -244,9 +255,56 @@ internal class TrayApplication : ApplicationContext
         _trayIcon.ContextMenuStrip = menu;
     }
 
+    private void OpenArrangeDisplays()
+    {
+        if (_arrangeForm is { IsDisposed: false })
+        {
+            if (_arrangeForm.WindowState == FormWindowState.Minimized)
+                _arrangeForm.WindowState = FormWindowState.Normal;
+            _arrangeForm.Activate();
+            return;
+        }
+
+        _profileManager.Reload();
+        _arrangeForm = new ArrangeDisplaysForm(
+            _profileManager,
+            Library,
+            profile => ApplyProfileAsync(profile, "Arrange Displays"),
+            () =>
+            {
+                UnregisterAllHotkeys();
+                RegisterAllHotkeys();
+                RebuildContextMenu();
+            });
+        _arrangeForm.FormClosed += (_, _) => _arrangeForm = null;
+        _arrangeForm.Show();
+        _arrangeForm.Activate();
+    }
+
+    /// <summary>One monitor library for the tray and the Arrange Displays window, so neither
+    /// overwrites the other's saves.</summary>
+    private MonitorLibrary Library => _library ??= MonitorLibrary.Load(_profileManager.Profiles);
+
+    /// <summary>A profile is a layout the user chose, so after switching to one its monitors'
+    /// positions become their usual places (what Arrange Displays restores and draws unplugged
+    /// monitors at). Never fails the switch.</summary>
+    private async Task RecordUsualPlacesAsync()
+    {
+        try
+        {
+            var inventory = await Task.Run(DisplayInventory.Query);
+            Library.Observe(inventory);
+            Library.RecordHome(inventory.ActivePositions(), []);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn($"Could not record the usual monitor places after a profile switch: {ex.Message}");
+        }
+    }
+
     private void CaptureCurrentSetup()
     {
-        using var dialog = new CaptureDialog(_profileManager.Profiles.Select(p => p.Name).ToList());
+        using var dialog = new CaptureDialog(_profileManager.Profiles);
         if (dialog.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.ProfileName))
         {
             var hotkey = dialog.SelectedHotkey;
@@ -309,27 +367,38 @@ internal class TrayApplication : ApplicationContext
             bool legacySurround = fresh.IsNvidiaSurround && fresh.NvidiaSurround == null;
             // Native display calls can block for minutes while the driver rebuilds its
             // topology. Keep the tray message loop alive and reject overlapping applies.
-            var outcome = await Task.Run(() => ProfileApplyRunner.Apply(fresh, _profileManager.Profiles, operationId, trigger));
+            var result = await Task.Run(() => ProfileApplyRunner.Apply(fresh, _profileManager.Profiles, operationId, trigger));
             if (legacySurround && fresh.NvidiaSurround != null)
                 _profileManager.SaveMigratedSurroundGrid(fresh);
             var inspector = await Task.Run(IpcDisplayInspector.Capture);
-            if (!inspector.Matches(fresh))
+            if (!inspector.Matches(result.Applied))
                 throw new InvalidOperationException("The driver finished the switch, but the live display layout does not match the saved profile. See Open Logs for details.");
             var status = inspector.ToStatus(_profileManager.Profiles);
-            ShowBalloon(outcome == ProfileApplyOutcome.AlreadyActive
-                ? $"'{fresh.Name}' is already active"
-                : $"Switched to '{fresh.Name}'");
+
+            string[]? skipped = null;
+            var skippedText = "";
+            if (result.SkippedMonitors.Count > 0)
+            {
+                skipped = result.SkippedMonitors.Select(Library.NameFor).ToArray();
+                skippedText = $" without {string.Join(", ", skipped)} (not connected)";
+            }
+            await RecordUsualPlacesAsync();
+            ShowBalloon(result.Outcome == ProfileApplyOutcome.AlreadyActive
+                ? $"'{fresh.Name}' is already active{skippedText}"
+                : $"Switched to '{fresh.Name}'{skippedText}",
+                skipped == null ? ToolTipIcon.Info : ToolTipIcon.Warning);
             return new IpcResponse
             {
                 Success = true,
-                Message = outcome switch
+                Message = result.Outcome switch
                 {
-                    ProfileApplyOutcome.AlreadyActive => $"Profile '{fresh.Name}' was already active and verified.",
-                    ProfileApplyOutcome.VerifiedAfterApiError => $"Applied and verified profile '{fresh.Name}' despite a display API error; see logs.",
-                    _ => $"Applied and verified profile '{fresh.Name}'.",
+                    ProfileApplyOutcome.AlreadyActive => $"Profile '{fresh.Name}' was already active and verified{skippedText}.",
+                    ProfileApplyOutcome.VerifiedAfterApiError => $"Applied and verified profile '{fresh.Name}'{skippedText} despite a display API error; see logs.",
+                    _ => $"Applied and verified profile '{fresh.Name}'{skippedText}.",
                 },
                 OperationId = operationId,
                 ProfileName = fresh.Name,
+                SkippedMonitors = skipped,
                 Status = status,
             };
         }

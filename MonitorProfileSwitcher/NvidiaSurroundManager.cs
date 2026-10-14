@@ -471,7 +471,7 @@ internal static class NvidiaSurroundManager
             lastError ?? new TimeoutException("No physical displays appeared after the Surround transition."));
     }
 
-    private static bool Matches(NvidiaSurroundConfig actual, NvidiaSurroundConfig expected) =>
+    internal static bool Matches(NvidiaSurroundConfig actual, NvidiaSurroundConfig expected) =>
         actual.Rows == expected.Rows && actual.Columns == expected.Columns &&
         actual.WidthPerDisplay == expected.WidthPerDisplay &&
         actual.HeightPerDisplay == expected.HeightPerDisplay &&

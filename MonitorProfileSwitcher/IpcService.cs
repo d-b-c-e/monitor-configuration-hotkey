@@ -207,6 +207,8 @@ internal sealed class IpcResponse
     public string? OperationId { get; set; }
     public string? ProfileName { get; set; }
     public IpcProfile[]? Profiles { get; set; }
+    /// <summary>apply only: monitors in the profile that were not connected and were left out.</summary>
+    public string[]? SkippedMonitors { get; set; }
     public IpcDisplayStatus? Status { get; set; }
 
     public static IpcResponse Error(string code, string message) => new()

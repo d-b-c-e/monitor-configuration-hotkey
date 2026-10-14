@@ -83,8 +83,33 @@ internal static class DisplayManager
         // driver to re-enable its last persisted grid.
         if (profile.NvidiaSurround != null)
         {
-            AppLog.Info($"Applying NVIDIA Surround profile '{profile.Name}' ({profile.NvidiaSurround.Rows}x{profile.NvidiaSurround.Columns}, displays={string.Join(",", profile.NvidiaSurround.Displays.Select(display => display.DisplayId))}).");
-            NvidiaSurroundManager.Apply(profile.NvidiaSurround);
+            // Enabling Surround leaves ONLY the Surround desktop active. Every other display,
+            // even one on another adapter (a USB DisplayLink panel), stays connected but is
+            // switched off. A profile that saved more than the Surround desktop must therefore
+            // restore its Windows layout on top of the grid.
+            var hasOtherMonitors = profile.Monitors.Length > 1;
+            var gridAlreadyLive = recentlyObservedSurround != null &&
+                NvidiaSurroundManager.Matches(recentlyObservedSurround, profile.NvidiaSurround);
+            if (gridAlreadyLive)
+            {
+                // Rebuilding a live grid is a ~15s driver reset that would only switch the
+                // other monitors off again; only the Windows layout around it differs.
+                AppLog.Info($"NVIDIA Surround grid for '{profile.Name}' is already active; applying its Windows layout only.");
+            }
+            else
+            {
+                AppLog.Info($"Applying NVIDIA Surround profile '{profile.Name}' ({profile.NvidiaSurround.Rows}x{profile.NvidiaSurround.Columns}, displays={string.Join(",", profile.NvidiaSurround.Displays.Select(display => display.DisplayId))}).");
+                NvidiaSurroundManager.Apply(profile.NvidiaSurround);
+            }
+
+            if (hasOtherMonitors || gridAlreadyLive)
+            {
+                // Never supply a topology without the Surround desktop in it: that would make
+                // the extra monitor the only display. Wait for every saved monitor first.
+                WaitForMonitorsAvailable(profile, TimeSpan.FromSeconds(10));
+                AppLog.Info($"Restoring the Windows layout of '{profile.Name}' around the Surround desktop ({profile.Monitors.Length} monitor(s)).");
+                ApplyWindowsTopology(profile);
+            }
             return;
         }
         if (profile.IsNvidiaSurround)
@@ -98,7 +123,103 @@ internal static class DisplayManager
         // Windows first, wait for the driver transition, then restore the saved Windows paths.
         var surroundWasDisabled = NvidiaSurroundManager.DisableIfActive(recentlyObservedSurround);
         AppLog.Info($"Applying Windows display profile '{profile.Name}'. NVIDIA Surround transition required={surroundWasDisabled}.");
+        ApplyWindowsTopology(profile);
+    }
 
+    /// <summary>Wait until every monitor saved in the profile is an available CCD target.
+    /// Throws, naming the missing monitors, if they do not all appear within the timeout.</summary>
+    private static void WaitForMonitorsAvailable(DisplayProfile profile, TimeSpan timeout)
+    {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            var (allPaths, _) = QueryConfig(
+                QueryDisplayConfigFlags.QDC_ALL_PATHS |
+                QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
+            var available = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var path in allPaths.Where(path => path.targetInfo.targetAvailable != 0))
+                available.Add(GetTargetDeviceName(path.targetInfo.adapterId, path.targetInfo.id).monitorDevicePath ?? "");
+
+            var missing = profile.Monitors.Where(monitor => !available.Contains(monitor.DevicePath)).ToList();
+            if (missing.Count == 0)
+            {
+                AppLog.Info($"All {profile.Monitors.Length} monitor(s) of '{profile.Name}' available after {elapsed.ElapsedMilliseconds}ms.");
+                return;
+            }
+            if (elapsed.Elapsed >= timeout)
+                throw new InvalidOperationException(
+                    $"'{profile.Name}' could not be completed: still waiting for {string.Join(", ", missing.Select(DescribeMonitor))} " +
+                    $"after {timeout.TotalSeconds:0}s. Check that those displays are powered on and connected.");
+            Thread.Sleep(250);
+        }
+
+        static string DescribeMonitor(MonitorInfo monitor) =>
+            string.IsNullOrWhiteSpace(monitor.FriendlyName) ? monitor.DevicePath : monitor.FriendlyName;
+    }
+
+    private const SetDisplayConfigFlags TopologyLookupFlags =
+        SetDisplayConfigFlags.SDC_TOPOLOGY_SUPPLIED |
+        SetDisplayConfigFlags.SDC_ALLOW_PATH_ORDER_CHANGES |
+        SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE;
+
+    private const SetDisplayConfigFlags BestModeFlags =
+        SetDisplayConfigFlags.SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+        SetDisplayConfigFlags.SDC_ALLOW_CHANGES |
+        SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE;
+
+    private static void ApplyWindowsTopology(DisplayProfile profile)
+    {
+        var (allPaths, matched) = BuildTopologyPaths(profile);
+
+        // Apply with SDC_TOPOLOGY_SUPPLIED — pass ALL paths, no modes; Windows takes the modes
+        // it last used for exactly this combination of monitors.
+        int result = DisplayConfigApi.SetDisplayConfig(allPaths.Length, allPaths, 0, null,
+            SetDisplayConfigFlags.SDC_APPLY | TopologyLookupFlags);
+        AppLog.Info($"SetDisplayConfig topology result={result}; requested={profile.Monitors.Length}; matched={matched}; allPaths={allPaths.Length}.");
+
+        if (result != DisplayConfigApi.ERROR_SUCCESS)
+        {
+            // That lookup fails for a combination Windows has never had (any layout built in
+            // Arrange Displays, or a profile with an unplugged monitor left out). Microsoft's
+            // documented recovery: the same paths with SDC_USE_SUPPLIED_DISPLAY_CONFIG, so best
+            // mode logic picks the modes. ApplyLayout below then sets the saved ones, and its
+            // SDC_SAVE_TO_DATABASE means the lookup works for this combination next time.
+            var retry = DisplayConfigApi.SetDisplayConfig(allPaths.Length, allPaths, 0, null,
+                SetDisplayConfigFlags.SDC_APPLY | SetDisplayConfigFlags.SDC_SAVE_TO_DATABASE | BestModeFlags);
+            AppLog.Info($"Windows has no stored layout for this monitor combination (topology lookup returned {result}); " +
+                $"best-mode retry result={retry}.");
+            if (retry != DisplayConfigApi.ERROR_SUCCESS)
+            {
+                throw new InvalidOperationException(
+                    $"Windows refused to switch on {DescribeMonitors(profile)} (SetDisplayConfig error {result}, then {retry}).");
+            }
+        }
+
+        // Phase 2: Apply saved positions, primary, and resolution
+        // Now that the correct monitors are active, query the current config
+        // and adjust positions/primary to match the saved profile
+        ApplyLayout(profile);
+    }
+
+    /// <summary>Asks Windows, without changing anything, whether it would accept the profile's
+    /// monitor combination: via its stored layout, and via best-mode logic. Diagnostics only.</summary>
+    internal static (int TopologyLookup, int BestMode) ValidateTopology(DisplayProfile profile)
+    {
+        var (allPaths, _) = BuildTopologyPaths(profile);
+        var lookup = DisplayConfigApi.SetDisplayConfig(allPaths.Length, allPaths, 0, null,
+            SetDisplayConfigFlags.SDC_VALIDATE | TopologyLookupFlags);
+        var bestMode = DisplayConfigApi.SetDisplayConfig(allPaths.Length, allPaths, 0, null,
+            SetDisplayConfigFlags.SDC_VALIDATE | BestModeFlags);
+        return (lookup, bestMode);
+    }
+
+    private static string DescribeMonitors(DisplayProfile profile) =>
+        string.Join(", ", profile.Monitors.Select(m => m.FriendlyName.Length > 0 ? m.FriendlyName : m.EdidId));
+
+    /// <summary>Every CCD path, with exactly one path per wanted monitor marked active (each with
+    /// its own clone group) and no modes supplied.</summary>
+    private static (DISPLAYCONFIG_PATH_INFO[] Paths, int Matched) BuildTopologyPaths(DisplayProfile profile)
+    {
         // Query ALL paths (including inactive)
         var (allPaths, _) = QueryConfig(
             QueryDisplayConfigFlags.QDC_ALL_PATHS |
@@ -128,7 +249,9 @@ internal static class DisplayManager
         // 3. Pass ALL paths to SetDisplayConfig with SDC_TOPOLOGY_SUPPLIED
 
         var matchedDevicePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var usedSourceIds = new HashSet<uint>();
+        // Source ids restart at 0 on every adapter, so a source is (adapter, id). Keying on the
+        // id alone let four NVIDIA monitors (sources 0-3) block every DisplayLink source.
+        var usedSources = new HashSet<(uint Low, int High, uint Id)>();
         var activatedIndices = new HashSet<int>();
         uint cloneGroup = 0;
 
@@ -143,7 +266,8 @@ internal static class DisplayManager
                     continue;
                 if (matchedDevicePaths.Contains(devicePath))
                     continue;
-                if (usedSourceIds.Contains(allPaths[i].sourceInfo.id))
+                var source = (allPaths[i].sourceInfo.adapterId.LowPart, allPaths[i].sourceInfo.adapterId.HighPart, allPaths[i].sourceInfo.id);
+                if (usedSources.Contains(source))
                     continue;
 
                 if (pass && savedMonitors.TryGetValue(devicePath, out var saved) &&
@@ -152,7 +276,7 @@ internal static class DisplayManager
 
                 activatedIndices.Add(i);
                 matchedDevicePaths.Add(devicePath);
-                usedSourceIds.Add(allPaths[i].sourceInfo.id);
+                usedSources.Add(source);
             }
         }
 
@@ -189,29 +313,7 @@ internal static class DisplayManager
             }
         }
 
-        // Apply with SDC_TOPOLOGY_SUPPLIED — pass ALL paths, no modes
-        int result = DisplayConfigApi.SetDisplayConfig(
-            allPaths.Length, allPaths,
-            0, null,
-            SetDisplayConfigFlags.SDC_APPLY |
-            SetDisplayConfigFlags.SDC_TOPOLOGY_SUPPLIED |
-            SetDisplayConfigFlags.SDC_ALLOW_PATH_ORDER_CHANGES |
-            SetDisplayConfigFlags.SDC_VIRTUAL_MODE_AWARE);
-
-        AppLog.Info($"SetDisplayConfig topology result={result}; requested={profile.Monitors.Length}; matched={activatedIndices.Count}; allPaths={allPaths.Length}.");
-
-        if (result != DisplayConfigApi.ERROR_SUCCESS)
-        {
-            throw new InvalidOperationException(
-                $"SetDisplayConfig failed with error code {result}. " +
-                $"Tried to activate {activatedIndices.Count} monitor(s): " +
-                string.Join(", ", profile.Monitors.Select(m => m.FriendlyName)));
-        }
-
-        // Phase 2: Apply saved positions, primary, and resolution
-        // Now that the correct monitors are active, query the current config
-        // and adjust positions/primary to match the saved profile
-        ApplyLayout(profile);
+        return (allPaths, activatedIndices.Count);
     }
 
     private static void ApplyLayout(DisplayProfile profile)
@@ -387,6 +489,23 @@ internal static class DisplayManager
         return string.Join(Environment.NewLine, lines);
     }
 
+    /// <summary>Device paths of monitors that are connected right now (on or off). Unlike
+    /// <see cref="GetAvailableMonitorDevicePaths"/>, this checks the target is actually available.</summary>
+    public static HashSet<string> GetConnectedMonitorDevicePaths()
+    {
+        var (paths, _) = QueryConfig(
+            QueryDisplayConfigFlags.QDC_ALL_PATHS |
+            QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
+        var devicePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths.Where(path => path.targetInfo.targetAvailable != 0))
+        {
+            var name = GetTargetDeviceName(path.targetInfo.adapterId, path.targetInfo.id);
+            if (!string.IsNullOrWhiteSpace(name.monitorDevicePath))
+                devicePaths.Add(name.monitorDevicePath);
+        }
+        return devicePaths;
+    }
+
     /// <summary>Unique device paths currently available to Windows, including inactive paths.</summary>
     public static HashSet<string> GetAvailableMonitorDevicePaths()
     {
@@ -403,7 +522,7 @@ internal static class DisplayManager
         return devicePaths;
     }
 
-    private static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) QueryConfig(
+    internal static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes) QueryConfig(
         QueryDisplayConfigFlags flags)
     {
         int retries = 3;
@@ -430,7 +549,7 @@ internal static class DisplayManager
         throw new InvalidOperationException("QueryDisplayConfig failed after retries");
     }
 
-    private static DISPLAYCONFIG_TARGET_DEVICE_NAME GetTargetDeviceName(LUID adapterId, uint targetId)
+    internal static DISPLAYCONFIG_TARGET_DEVICE_NAME GetTargetDeviceName(LUID adapterId, uint targetId)
     {
         var name = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
         name.header.type = DISPLAYCONFIG_DEVICE_INFO_TYPE.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
@@ -441,7 +560,7 @@ internal static class DisplayManager
         return name;
     }
 
-    private static DISPLAYCONFIG_SOURCE_DEVICE_NAME GetSourceDeviceName(LUID adapterId, uint sourceId)
+    internal static DISPLAYCONFIG_SOURCE_DEVICE_NAME GetSourceDeviceName(LUID adapterId, uint sourceId)
     {
         var name = new DISPLAYCONFIG_SOURCE_DEVICE_NAME();
         name.header.type = DISPLAYCONFIG_DEVICE_INFO_TYPE.DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;

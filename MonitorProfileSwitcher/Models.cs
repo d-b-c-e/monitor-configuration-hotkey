@@ -16,9 +16,32 @@ internal class DisplayProfile
     public bool IsNvidiaSurround => NvidiaSurround != null ||
         (Monitors.Length == 1 && Monitors[0].FriendlyName.Equals("NV Surround", StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>The logical NVIDIA Surround desktop among this profile's monitors, if any.
+    /// It only exists while the grid is enabled, so it is never "missing" before an apply.</summary>
+    [JsonIgnore]
+    public MonitorInfo? SurroundMonitor => !IsNvidiaSurround ? null :
+        Monitors.FirstOrDefault(monitor => monitor.FriendlyName.Equals("NV Surround", StringComparison.OrdinalIgnoreCase)) ??
+        (NvidiaSurround == null ? null : Monitors.FirstOrDefault(monitor =>
+            monitor.Resolution.Width == NvidiaSurround.WidthPerDisplay * NvidiaSurround.Columns &&
+            monitor.Resolution.Height == NvidiaSurround.HeightPerDisplay * NvidiaSurround.Rows)) ??
+        (Monitors.Length == 1 ? Monitors[0] : null);
+
+    /// <summary>A copy of this profile with a different monitor list; keeps the Id, so window
+    /// layouts and verification still refer to the same profile.</summary>
+    public DisplayProfile WithMonitors(MonitorInfo[] monitors) => new()
+    {
+        Id = Id,
+        Name = Name,
+        Hotkey = Hotkey,
+        Monitors = monitors,
+        NvidiaSurround = NvidiaSurround,
+        CapturedAt = CapturedAt,
+    };
+
     [JsonIgnore]
     public string DisplaySummary => NvidiaSurround != null
-        ? $"NVIDIA Surround {NvidiaSurround.Rows}x{NvidiaSurround.Columns}"
+        ? $"NVIDIA Surround {NvidiaSurround.Rows}x{NvidiaSurround.Columns}" +
+          (Monitors.Length > 1 ? $" + {Monitors.Length - 1} monitor(s)" : "")
         : $"{Monitors.Length} monitor(s)";
 }
 
@@ -71,6 +94,26 @@ internal class MonitorInfo
     public DISPLAYCONFIG_SCALING Scaling { get; set; } = DISPLAYCONFIG_SCALING.IDENTITY;
 
     public MonitorRefreshRate RefreshRate { get; set; } = new();
+
+    /// <summary>EDID manufacturer+product id from the device path, e.g. MSI3FA8.</summary>
+    [JsonIgnore]
+    public string EdidId => DisplayLayout.EdidIdFromDevicePath(DevicePath);
+
+    public MonitorInfo Clone() => new()
+    {
+        DevicePath = DevicePath,
+        FriendlyName = FriendlyName,
+        GdiDeviceName = GdiDeviceName,
+        SourceId = SourceId,
+        TargetId = TargetId,
+        IsPrimary = IsPrimary,
+        Position = new MonitorPosition { X = Position.X, Y = Position.Y },
+        Resolution = new MonitorResolution { Width = Resolution.Width, Height = Resolution.Height },
+        OutputTechnology = OutputTechnology,
+        Rotation = Rotation,
+        Scaling = Scaling,
+        RefreshRate = RefreshRate.Clone(),
+    };
 }
 
 /// <summary>
@@ -93,12 +136,22 @@ internal class MonitorRefreshRate
     [JsonIgnore]
     public bool IsSpecified => Numerator != 0 && Denominator != 0;
 
+    /// <summary>Set (never persisted) for a rate picked from a whole-Hz mode list, when the
+    /// monitor's exact rational for it has not been observed yet. Windows picks the nearest
+    /// real mode, so such a rate matches anything within half a hertz.</summary>
+    [JsonIgnore]
+    public bool IsApproximate { get; set; }
+
     public double ToHz() => Denominator == 0 ? 0 : (double)Numerator / Denominator;
 
     public override string ToString() => IsSpecified ? $"{ToHz():F2}Hz" : "(unset)";
 
-    public bool Matches(DISPLAYCONFIG_RATIONAL other) =>
-        Numerator == other.Numerator && Denominator == other.Denominator;
+    public bool Matches(DISPLAYCONFIG_RATIONAL other) => IsApproximate
+        ? other.Denominator != 0 && Math.Abs(ToHz() - (double)other.Numerator / other.Denominator) < 0.5
+        : Numerator == other.Numerator && Denominator == other.Denominator;
+
+    public MonitorRefreshRate Clone() =>
+        new() { Numerator = Numerator, Denominator = Denominator, IsApproximate = IsApproximate };
 
     public static MonitorRefreshRate From(DISPLAYCONFIG_RATIONAL r) =>
         new() { Numerator = r.Numerator, Denominator = r.Denominator };

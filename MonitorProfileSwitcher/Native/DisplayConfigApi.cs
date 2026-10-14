@@ -35,6 +35,20 @@ internal static class DisplayConfigApi
     public static extern int DisplayConfigGetDeviceInfo(
         ref DISPLAYCONFIG_SOURCE_DEVICE_NAME deviceName);
 
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(
+        ref DISPLAYCONFIG_TARGET_PREFERRED_MODE preferredMode);
+
+    // Classic GDI enumeration. CCD has no mode-list call, so the modes a monitor supports
+    // come from EnumDisplaySettingsEx on its active source; adapter names from EnumDisplayDevices.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool EnumDisplaySettingsEx(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode, uint dwFlags);
+
+    public const int ENUM_CURRENT_SETTINGS = -1;
+
     public const int ERROR_SUCCESS = 0;
     public const int ERROR_INSUFFICIENT_BUFFER = 122;
 
@@ -307,4 +321,68 @@ internal struct DISPLAYCONFIG_SOURCE_DEVICE_NAME
     public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
     [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
     public string viewGdiDeviceName;
+}
+
+/// <summary>The monitor's native mode. Works for connected targets that are switched off,
+/// which is the only way to learn anything about a display Windows is not driving.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct DISPLAYCONFIG_TARGET_PREFERRED_MODE
+{
+    public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    public uint width;
+    public uint height;
+    public DISPLAYCONFIG_TARGET_MODE targetMode;
+}
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct DISPLAY_DEVICE
+{
+    public int cb;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string DeviceName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+    public string DeviceString;
+    public uint StateFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+    public string DeviceID;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+    public string DeviceKey;
+}
+
+/// <summary>DEVMODEW, display-device variant of the union.</summary>
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+internal struct DEVMODE
+{
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string dmDeviceName;
+    public ushort dmSpecVersion;
+    public ushort dmDriverVersion;
+    public ushort dmSize;
+    public ushort dmDriverExtra;
+    public uint dmFields;
+    public int dmPositionX;
+    public int dmPositionY;
+    public uint dmDisplayOrientation;
+    public uint dmDisplayFixedOutput;
+    public short dmColor;
+    public short dmDuplex;
+    public short dmYResolution;
+    public short dmTTOption;
+    public short dmCollate;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+    public string dmFormName;
+    public ushort dmLogPixels;
+    public uint dmBitsPerPel;
+    public uint dmPelsWidth;
+    public uint dmPelsHeight;
+    public uint dmDisplayFlags;
+    public uint dmDisplayFrequency;
+    public uint dmICMMethod;
+    public uint dmICMIntent;
+    public uint dmMediaType;
+    public uint dmDitherType;
+    public uint dmReserved1;
+    public uint dmReserved2;
+    public uint dmPanningWidth;
+    public uint dmPanningHeight;
 }
