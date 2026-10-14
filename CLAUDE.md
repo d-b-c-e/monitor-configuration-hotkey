@@ -24,7 +24,7 @@ Built because MultiMonitorTool and DisplayFusion can't disable monitors on Windo
 - `ProfileManager.cs` — JSON serialization, CRUD for profiles
 - `TrayApplication.cs` — System tray icon, context menu, hotkey handling
 - `IpcService.cs` / `IpcDisplayInspector.cs` — Current-user named pipe, profile queries, and verified apply responses
-- `ManageProfilesDialog.cs` — Profile ordering, renaming, and hotkey management
+- `ManageProfilesDialog.cs` — Profile ordering, renaming, deletion, and hotkey management (all staged until Save)
 - `CaptureDialog.cs` / `HotkeyDialog.cs` — Capture and hotkey WinForms dialogs
 - `AppLog.cs` — Non-fatal rotating file diagnostics
 - `Models.cs` — Data models for profiles, monitors, hotkeys
@@ -161,7 +161,7 @@ hotkeys at all.
 
 **Working**: CCD capture/apply, monitor enable/disable, position, primary display, resolution,
 rotation, refresh rate, NVIDIA Surround ↔ independent-monitor switching, profile persistence and
-legacy migration, profile ordering/renaming/hotkey management, rotating switch diagnostics, tray UI,
+legacy migration, profile ordering/renaming/deletion/hotkey management, rotating switch diagnostics, tray UI,
 global hotkeys with retry/error reporting, CLI diagnostics, and updater.
 
 The 1x3 Surround → three independent displays → 1x3 Surround round trip was exercised on a

@@ -3,9 +3,14 @@ namespace MonitorProfileSwitcher;
 internal sealed class ManageProfilesDialog : Form
 {
     private readonly List<ProfileMetadataEdit> _edits;
+    private readonly List<string> _deletedProfileNames = [];
     private readonly ListView _profileList;
 
     public IReadOnlyList<ProfileMetadataEdit> Edits => _edits;
+
+    /// <summary>Original names of profiles removed in this dialog. Like every other edit here,
+    /// deletions are staged and only take effect when the dialog is saved.</summary>
+    public IReadOnlyList<string> DeletedProfileNames => _deletedProfileNames;
 
     public ManageProfilesDialog(IReadOnlyList<DisplayProfile> profiles)
     {
@@ -27,7 +32,7 @@ internal sealed class ManageProfilesDialog : Form
 
         Controls.Add(new Label
         {
-            Text = "Select a profile to rename it, change its hotkey, or move it in the tray-menu order.",
+            Text = "Select a profile to rename it, change its hotkey, delete it, or move it in the tray-menu order.",
             AutoSize = true,
             Left = 12,
             Top = 13,
@@ -49,6 +54,12 @@ internal sealed class ManageProfilesDialog : Form
         _profileList.Columns.Add("Hotkey", 135);
         _profileList.Columns.Add("Type", 140);
         _profileList.DoubleClick += (_, _) => RenameSelected();
+        _profileList.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Delete) return;
+            e.Handled = true;
+            DeleteSelected();
+        };
         Controls.Add(_profileList);
 
         Controls.AddRange([
@@ -56,6 +67,7 @@ internal sealed class ManageProfilesDialog : Form
             CreateActionButton("Move Down", 598, 76, MoveSelectedDown),
             CreateActionButton("Rename...", 598, 128, RenameSelected),
             CreateActionButton("Hotkey...", 598, 164, ChangeSelectedHotkey),
+            CreateActionButton("Delete...", 598, 216, DeleteSelected),
         ]);
 
         var saveButton = new Button { Text = "Save", Left = 566, Top = 360, Width = 80 };
@@ -136,6 +148,22 @@ internal sealed class ManageProfilesDialog : Form
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         _edits[index].Hotkey = dialog.SelectedHotkey?.Clone();
         RefreshList(index);
+    }
+
+    private void DeleteSelected()
+    {
+        var index = SelectedIndex;
+        if (index < 0) return;
+
+        var edit = _edits[index];
+        var confirm = MessageBox.Show(this,
+            $"Delete the profile '{edit.Name}'?\n\nIt is removed when you click Save; Cancel keeps it.",
+            "Delete Profile", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes) return;
+
+        _deletedProfileNames.Add(edit.OriginalName);
+        _edits.RemoveAt(index);
+        RefreshList(Math.Min(index, _edits.Count - 1));
     }
 
     private void SaveChanges()

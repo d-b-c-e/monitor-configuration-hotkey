@@ -270,11 +270,14 @@ internal class TrayApplication : ApplicationContext
 
         try
         {
-            _profileManager.ApplyMetadataChanges(dialog.Edits);
+            _profileManager.ApplyMetadataChanges(dialog.Edits, dialog.DeletedProfileNames);
             UnregisterAllHotkeys();
             RegisterAllHotkeys();
             RebuildContextMenu();
-            ShowBalloon("Profile changes saved");
+            var deleted = dialog.DeletedProfileNames.Count;
+            ShowBalloon(deleted == 0
+                ? "Profile changes saved"
+                : $"Profile changes saved ({deleted} profile{(deleted == 1 ? "" : "s")} deleted)");
         }
         catch (Exception ex)
         {

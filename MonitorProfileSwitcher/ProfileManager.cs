@@ -133,13 +133,20 @@ internal class ProfileManager
         }
     }
 
-    public void ApplyMetadataChanges(IReadOnlyList<ProfileMetadataEdit> edits)
+    public void ApplyMetadataChanges(IReadOnlyList<ProfileMetadataEdit> edits, IReadOnlyList<string> deletedNames)
     {
-        if (edits.Count != _store.Profiles.Count)
+        if (edits.Count + deletedNames.Count != _store.Profiles.Count)
             throw new InvalidOperationException("The profile list changed while it was being edited. Reopen Manage Profiles and try again.");
 
         var existingByName = _store.Profiles.ToDictionary(profile => profile.Name, StringComparer.OrdinalIgnoreCase);
         var originals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Every saved profile must be accounted for exactly once, as either kept or deleted;
+        // otherwise the dialog was working from a stale list and nothing is written.
+        foreach (var deletedName in deletedNames)
+        {
+            if (!originals.Add(deletedName) || !existingByName.ContainsKey(deletedName))
+                throw new InvalidOperationException("The profile list changed while it was being edited. Reopen Manage Profiles and try again.");
+        }
         var newNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var reordered = new List<DisplayProfile>(edits.Count);
 
@@ -162,6 +169,8 @@ internal class ProfileManager
         _store.Profiles.Clear();
         _store.Profiles.AddRange(reordered);
         Save();
+        if (deletedNames.Count > 0)
+            AppLog.Info($"Deleted profile(s) from Manage Profiles: {string.Join(", ", deletedNames)}");
         AppLog.Info($"Updated profile names, order, and hotkeys: {string.Join(", ", reordered.Select(profile => $"{profile.Name} [{profile.Hotkey?.ToString() ?? "no hotkey"}]"))}");
     }
 
