@@ -103,9 +103,21 @@ puts that confirm on a single screen that is easy to lose.
 - **Refresh rates:** GDI lists whole hertz, but verification compares the exact CCD rational. A
   rate picked from the list uses the exact rational last seen for that resolution
   (`ExactRates`), or else an `IsApproximate` rate that matches within 0.5 Hz. Never persisted.
-- **Surround in the editor:** the live Surround desktop is one tile (position only; its mode is the
-  grid's). Removing it from the layout turns Surround off. Creating a new grid is not in the editor
-  yet; profiles still switch Surround on.
+- **Surround in the editor (1.2.0):** the live Surround desktop is one tile (position only; its mode
+  is the grid's). Right-click a panel → **Combine row into NVIDIA Surround** stages a 1xN grid from
+  the enabled NVIDIA panels side by side with it (same size, rate and rotation, tops aligned), in
+  canvas left-to-right order; the panels fold into one tile until Apply (Undo combine reverses it).
+  The grid comes from NVAPI: `NvAPI_DISP_GetDisplayIdByDisplayName` (0xAE457190, nvapi_interface.h)
+  maps each panel's `\\.\DISPLAYn` to its NVIDIA display id, and its 1x1 grid supplies the mode —
+  for this rig it reproduces NVIDIA Control Panel's grid exactly (same ids, same order). Right-click
+  the live Surround → **Split** stages turning it off with the panels placed side by side where it
+  was (main display = middle panel). The panels of a live Surround are invisible to CCD, so they are
+  identified by sharing the Surround desktop's EDID id.
+- **Missing monitors are decided after the Surround transition** (`DisplayManager.ApplyProfile`
+  returns what it applied). While Surround is on its panels look unplugged; v1.1.0 decided before
+  the transition and so dropped the triples when switching Surround → a non-Surround profile.
+- A Surround desktop's device path is resolved from the live `NV Surround` target after the grid is
+  up (`ResolveSurroundDevicePath`), so staged grids and renumbered desktops both work.
 
 ## Unplugged monitors in a profile (1.1.0)
 

@@ -45,14 +45,24 @@ internal sealed class ArrangedMonitor
     /// <summary>Some position is known for it (usual place or where Windows last had it).</summary>
     public bool HasRememberedSpot { get; set; }
 
+    /// <summary>A Surround display staged in this editor (not live yet): the grid to enable.</summary>
+    public NvidiaSurroundConfig? StagedGrid { get; set; }
+    /// <summary>For a staged Surround: the panels it is made of, left to right.</summary>
+    public List<string> SurroundMembers { get; set; } = [];
+    /// <summary>A panel folded into a staged Surround; hidden until the combine is undone.</summary>
+    public bool MergedIntoSurround { get; set; }
+    /// <summary>A panel of the live Surround that a staged split gives back to Windows.</summary>
+    public bool ReleasedFromSurround { get; set; }
+
     public string EdidId => DisplayLayout.EdidIdFromDevicePath(DevicePath);
-    public bool CanEnable => Availability == MonitorAvailability.Connected;
+    public bool IsNvidia => AdapterName.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase);
+    public bool CanEnable => Availability == MonitorAvailability.Connected || ReleasedFromSurround;
 
     /// <summary>Drawn in the layout: on, switched off but connected, or unplugged with a usual
     /// place (as an outline — the MSI and the Odyssey sharing one cable share one spot). An
     /// unplugged monitor never placed by the user waits in the strip to be dragged into place.</summary>
-    public bool InLayout => Enabled || CanEnable ||
-        (Availability == MonitorAvailability.NotConnected && Home != null);
+    public bool InLayout => !MergedIntoSurround && (Enabled || CanEnable ||
+        (Availability == MonitorAvailability.NotConnected && Home != null));
 
     /// <summary>On, but not where the user last put it (typically Windows re-placing a monitor
     /// that was just plugged in). A few pixels of drift is not worth offering to fix.</summary>
@@ -317,15 +327,48 @@ internal static class ArrangementModel
         }).ToArray();
         DisplayLayout.Repair(infos);
 
+        // Keeping the Surround desktop means keeping its grid (or enabling the one staged here);
+        // leaving it out of the layout turns Surround off and gives the panels back to Windows.
+        var surround = enabled.FirstOrDefault(monitor => monitor.IsSurround);
         return new DisplayProfile
         {
             Id = "arrange-displays",
             Name = "Arranged layout",
             Monitors = infos,
-            // Keeping the Surround desktop means keeping its grid; leaving it out of the
-            // layout turns Surround off and gives the panels back to Windows.
-            NvidiaSurround = enabled.Any(monitor => monitor.IsSurround) ? liveSurround : null,
+            NvidiaSurround = surround == null ? null : surround.StagedGrid ?? liveSurround,
         };
+    }
+
+    /// <summary>
+    /// The row of panels that would form a Surround with <paramref name="monitor"/>: enabled
+    /// NVIDIA panels of the same size and rate, side by side with tops aligned, left to right.
+    /// Fewer than two means there is no row to combine.
+    /// </summary>
+    public static List<ArrangedMonitor> SurroundRow(IList<ArrangedMonitor> monitors, ArrangedMonitor monitor)
+    {
+        if (!monitor.Enabled || !monitor.IsNvidia || monitor.IsSurround)
+            return [];
+        bool Fits(ArrangedMonitor other) =>
+            other.Enabled && other.IsNvidia && !other.IsSurround && other.Y == monitor.Y &&
+            other.Width == monitor.Width && other.Height == monitor.Height && other.Rotation == monitor.Rotation &&
+            Math.Round(other.Rate.ToHz()) == Math.Round(monitor.Rate.ToHz());
+
+        var row = new List<ArrangedMonitor> { monitor };
+        for (var left = monitor; ;)
+        {
+            var next = monitors.FirstOrDefault(other => other != left && Fits(other) && other.Bounds.Right == left.X);
+            if (next == null) break;
+            row.Insert(0, next);
+            left = next;
+        }
+        for (var right = monitor; ;)
+        {
+            var next = monitors.FirstOrDefault(other => other != right && Fits(other) && other.X == right.Bounds.Right);
+            if (next == null) break;
+            row.Add(next);
+            right = next;
+        }
+        return row;
     }
 
     /// <summary>The live layout as a profile, to go back to if the user does not keep a change.</summary>

@@ -54,33 +54,20 @@ internal static class ProfileApplyRunner
 
         try
         {
-            // A monitor that is unplugged (or swapped for another on the same cable) must not
-            // strand the profile: apply what is connected and say what was left out.
-            IReadOnlyList<MonitorInfo> skipped = [];
-            var profile = saved;
-            try
-            {
-                profile = DisplayLayout.WithoutMissingMonitors(saved, DisplayManager.GetConnectedMonitorDevicePaths(), out skipped);
-                if (skipped.Count > 0)
-                    AppLog.Warn($"[{operationId}] Not connected, skipped: {string.Join(", ", skipped.Select(Describe))}. Re-laid out the rest: " +
-                        string.Join(", ", profile.Monitors.Select(monitor => $"{Describe(monitor)} at ({monitor.Position.X},{monitor.Position.Y}){(monitor.IsPrimary ? " primary" : "")}")));
-            }
-            catch (Exception ex)
-            {
-                AppLog.Warn($"[{operationId}] Could not check which monitors are connected; applying the profile as saved: {ex.Message}");
-            }
-
             // Never ask the driver to rebuild a topology that is already correct. Besides
             // being faster, this avoids a second mode change after an earlier call returned
-            // an error even though Windows actually completed the transition.
+            // an error even though Windows actually completed the transition. "Correct" allows
+            // for unplugged monitors; which ones are missing for the real apply is decided
+            // inside ApplyProfile, after any Surround transition.
             IpcDisplayInspector? before = null;
             try
             {
+                var preview = WithConnectedMonitors(saved, out var previewSkipped);
                 before = IpcDisplayInspector.Capture();
-                if ((profile.NvidiaSurround != null || !profile.IsNvidiaSurround) && before.Matches(profile))
+                if ((preview.NvidiaSurround != null || !preview.IsNvidiaSurround) && before.Matches(preview))
                 {
-                    AppLog.Info($"[{operationId}] Apply skipped: '{profile.Name}' already matches the live layout.");
-                    return new ProfileApplyResult(ProfileApplyOutcome.AlreadyActive, profile, skipped);
+                    AppLog.Info($"[{operationId}] Apply skipped: '{saved.Name}' already matches the live layout.");
+                    return new ProfileApplyResult(ProfileApplyOutcome.AlreadyActive, preview, previewSkipped);
                 }
             }
             catch (Exception ex)
@@ -89,11 +76,13 @@ internal static class ProfileApplyRunner
             }
 
             if (before != null && manageWindowLayouts)
-                WindowLayoutManager.BeforeSwitch(before, profile, profiles, operationId);
+                WindowLayoutManager.BeforeSwitch(before, saved, profiles, operationId);
 
+            DisplayProfile profile;
+            IReadOnlyList<MonitorInfo> skipped;
             try
             {
-                DisplayManager.ApplyProfile(profile, before?.ActiveSurround);
+                (profile, skipped) = DisplayManager.ApplyProfile(saved, before?.ActiveSurround);
             }
             catch (Exception apiError)
             {
@@ -105,13 +94,14 @@ internal static class ProfileApplyRunner
                 // Display drivers can return an error after changing the topology. Do not
                 // retry blindly: observe the real state first, and only report success when
                 // the entire saved profile (including refresh rate) is verified.
-                if (WaitForMatch(profile, TimeSpan.FromSeconds(3), out _))
+                var expected = WithConnectedMonitors(saved, out var expectedSkipped);
+                if (WaitForMatch(expected, TimeSpan.FromSeconds(3), out _))
                 {
-                    AppLog.Warn($"[{operationId}] Display API returned '{apiError.Message}', but '{profile.Name}' is now fully verified. No retry was issued.");
+                    AppLog.Warn($"[{operationId}] Display API returned '{apiError.Message}', but '{saved.Name}' is now fully verified. No retry was issued.");
                     if (manageWindowLayouts)
-                        WindowLayoutManager.AfterSwitch(profile, operationId);
+                        WindowLayoutManager.AfterSwitch(expected, operationId);
                     AppLog.Info($"[{operationId}] Apply verified after API error in {started.ElapsedMilliseconds}ms. After:{Environment.NewLine}{SafeDescribeCurrentConfig()}");
-                    return new ProfileApplyResult(ProfileApplyOutcome.VerifiedAfterApiError, profile, skipped);
+                    return new ProfileApplyResult(ProfileApplyOutcome.VerifiedAfterApiError, expected, expectedSkipped);
                 }
                 throw;
             }
@@ -135,8 +125,21 @@ internal static class ProfileApplyRunner
         }
     }
 
-    private static string Describe(MonitorInfo monitor) =>
-        !string.IsNullOrWhiteSpace(monitor.FriendlyName) ? monitor.FriendlyName : monitor.EdidId;
+    /// <summary>The profile as it would apply with the monitors connected right now. Only valid
+    /// for comparing against the live state: while Surround is on, its panels look unplugged.</summary>
+    private static DisplayProfile WithConnectedMonitors(DisplayProfile saved, out IReadOnlyList<MonitorInfo> skipped)
+    {
+        try
+        {
+            return DisplayLayout.WithoutMissingMonitors(saved, DisplayManager.GetConnectedMonitorDevicePaths(), out skipped);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn($"Could not check which monitors are connected; using the profile as saved: {ex.Message}");
+            skipped = [];
+            return saved;
+        }
+    }
 
     private static bool WaitForMatch(DisplayProfile profile, TimeSpan timeout, out string mismatch)
     {

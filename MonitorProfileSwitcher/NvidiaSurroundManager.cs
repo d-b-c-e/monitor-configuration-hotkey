@@ -74,6 +74,72 @@ internal static class NvidiaSurroundManager
         }
     }
 
+    /// <summary>
+    /// A 1xN Surround grid made of the given active NVIDIA monitors, left to right in the order
+    /// given (their GDI names, e.g. \\.\DISPLAY1). Each must currently run as its own display,
+    /// and all must share one mode — NVIDIA Surround requires it.
+    /// </summary>
+    public static NvidiaSurroundConfig BuildRowGrid(IReadOnlyList<string> gdiDeviceNamesLeftToRight)
+    {
+        if (gdiDeviceNamesLeftToRight.Count < 2)
+            throw new InvalidOperationException("NVIDIA Surround needs at least two displays.");
+
+        NvidiaSurroundConfig? config = null;
+        lock (Sync)
+        {
+            WithNvApi(() =>
+            {
+                var singles = NvApi.EnumerateDisplayGrids()
+                    .Where(grid => grid.Rows == 1 && grid.Columns == 1 && grid.DisplayCount == 1)
+                    .GroupBy(grid => grid.Displays[0].DisplayId)
+                    .ToDictionary(group => group.Key, group => group.First());
+
+                var members = new List<(uint DisplayId, NvMosaicGridTopologyV2 Grid)>();
+                foreach (var name in gdiDeviceNamesLeftToRight)
+                {
+                    var displayId = NvApi.GetDisplayIdByDisplayName(name);
+                    if (!singles.TryGetValue(displayId, out var grid))
+                        throw new InvalidOperationException($"{name} is not running as a separate NVIDIA display, so it cannot join Surround.");
+                    members.Add((displayId, grid));
+                }
+
+                var mode = members[0].Grid.DisplaySettings;
+                var odd = members.FirstOrDefault(member =>
+                    member.Grid.DisplaySettings.Width != mode.Width || member.Grid.DisplaySettings.Height != mode.Height ||
+                    member.Grid.DisplaySettings.Frequency != mode.Frequency || member.Grid.DisplaySettings.BitsPerPixel != mode.BitsPerPixel);
+                if (odd.Grid.Displays != null)
+                    throw new InvalidOperationException(
+                        $"Every display in NVIDIA Surround must run the same mode: {mode.Width}x{mode.Height} @ {mode.Frequency} Hz vs " +
+                        $"{odd.Grid.DisplaySettings.Width}x{odd.Grid.DisplaySettings.Height} @ {odd.Grid.DisplaySettings.Frequency} Hz. " +
+                        "Set them to match and apply that first.");
+
+                config = new NvidiaSurroundConfig
+                {
+                    Rows = 1,
+                    Columns = (uint)members.Count,
+                    WidthPerDisplay = mode.Width,
+                    HeightPerDisplay = mode.Height,
+                    BitsPerPixel = mode.BitsPerPixel,
+                    Frequency = mode.Frequency,
+                    ImmersiveGaming = true,
+                    // What NVIDIA Control Panel sets for a GeForce Surround (matches grids captured here).
+                    AcceleratePrimaryDisplay = true,
+                    Displays = members.Select(member => new NvidiaSurroundDisplay
+                    {
+                        DisplayId = member.DisplayId,
+                        Rotation = member.Grid.Displays[0].Rotation,
+                        PixelShiftType = member.Grid.Displays[0].PixelShiftType,
+                    }).ToArray(),
+                };
+            });
+        }
+
+        Validate(config!);
+        AppLog.Info($"Built a 1x{config!.Columns} Surround grid from {string.Join(", ", gdiDeviceNamesLeftToRight)}: " +
+            $"displays={string.Join(",", config.Displays.Select(display => display.DisplayId))}, {config.WidthPerDisplay}x{config.HeightPerDisplay}@{config.Frequency}.");
+        return config;
+    }
+
     public static string ValidateActive()
     {
         lock (Sync)

@@ -19,6 +19,7 @@ internal static class NvApi
     private const uint SetDisplayGridsId = 0x4D959A89;
     private const uint ValidateDisplayGridsId = 0xCF43903D;
     private const uint EnumDisplayGridsId = 0xDF2887AF;
+    private const uint GetDisplayIdByDisplayNameId = 0xAE457190; // nvapi_interface.h
 
     private static readonly IntPtr Library = LoadLibrary();
     private static readonly QueryInterfaceDelegate QueryInterface = LoadQueryInterface();
@@ -30,7 +31,19 @@ internal static class NvApi
     private static readonly ValidateDisplayGridsDelegate ValidateDisplayGridsFunction = GetFunction<ValidateDisplayGridsDelegate>(ValidateDisplayGridsId);
     private static readonly EnumDisplayGridsDelegate EnumDisplayGridsFunction = GetFunction<EnumDisplayGridsDelegate>(EnumDisplayGridsId);
 
+    private static GetDisplayIdByDisplayNameDelegate? _getDisplayIdByDisplayName;
+
     internal static void Initialize() => ThrowIfFailed(InitializeFunction(), "NvAPI_Initialize");
+
+    /// <summary>The NVIDIA display id behind a GDI display (\\.\DISPLAYn) — how a monitor on the
+    /// Windows desktop is matched to an entry in NVIDIA's display grids. Resolved on first use
+    /// rather than at type load, so a driver without it cannot break Surround switching.</summary>
+    internal static uint GetDisplayIdByDisplayName(string gdiDeviceName)
+    {
+        _getDisplayIdByDisplayName ??= GetFunction<GetDisplayIdByDisplayNameDelegate>(GetDisplayIdByDisplayNameId);
+        ThrowIfFailed(_getDisplayIdByDisplayName(gdiDeviceName, out var displayId), "NvAPI_DISP_GetDisplayIdByDisplayName");
+        return displayId;
+    }
 
     internal static void Unload()
     {
@@ -190,6 +203,9 @@ internal static class NvApi
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int EnumDisplayGridsDelegate(IntPtr grids, ref uint gridCount);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int GetDisplayIdByDisplayNameDelegate([MarshalAs(UnmanagedType.LPStr)] string displayName, out uint displayId);
 }
 
 internal sealed class NvidiaApiException : InvalidOperationException

@@ -237,6 +237,8 @@ internal sealed class ArrangeDisplaysForm : Form
         var byPath = fresh.ToDictionary(monitor => monitor.DevicePath, StringComparer.OrdinalIgnoreCase);
         foreach (var monitor in _monitors.ToList())
         {
+            if (monitor.StagedGrid != null)
+                continue; // a Surround staged here does not exist for Windows yet
             if (!byPath.TryGetValue(monitor.DevicePath, out var now))
             {
                 _monitors.Remove(monitor);
@@ -254,9 +256,9 @@ internal sealed class ArrangeDisplaysForm : Form
         }
         foreach (var monitor in fresh.Where(f => _monitors.All(m => !m.DevicePath.Equals(f.DevicePath, StringComparison.OrdinalIgnoreCase))))
             _monitors.Add(monitor);
-        for (int i = 0; i < _monitors.Count; i++)
-            _monitors[i].Number = fresh.FirstOrDefault(f => f.DevicePath.Equals(_monitors[i].DevicePath, StringComparison.OrdinalIgnoreCase))?.Number ?? i + 1;
-        ArrangementModel.MakeContiguous(_monitors);
+        foreach (var monitor in _monitors.Where(monitor => monitor.StagedGrid == null))
+            monitor.Number = fresh.FirstOrDefault(f => f.DevicePath.Equals(monitor.DevicePath, StringComparison.OrdinalIgnoreCase))?.Number ?? monitor.Number;
+        // Nothing is moved here: a refresh while editing must not rearrange the user's work.
     }
 
     protected override void WndProc(ref Message m)
@@ -334,8 +336,14 @@ internal sealed class ArrangeDisplaysForm : Form
             MonitorAvailability.InSurround => "Status: one of the panels in the active NVIDIA Surround display",
             _ => $"Status: not connected{(monitor.LastConnected is { } seen ? $" — last seen {seen.ToLocalTime():yyyy-MM-dd HH:mm}" : "")}",
         });
-        if (monitor.IsSurround)
-            lines.Add("This is the combined NVIDIA Surround display. Drag it off the layout to turn Surround off.");
+        if (monitor.StagedGrid != null)
+            lines.Add($"New NVIDIA Surround, {monitor.StagedGrid.Columns} panels left to right, " +
+                $"{monitor.StagedGrid.WidthPerDisplay}x{monitor.StagedGrid.HeightPerDisplay} @ {monitor.StagedGrid.Frequency} Hz each. " +
+                "It turns on when you Apply; right-click → Undo combine to go back.");
+        else if (monitor.IsSurround)
+            lines.Add("This is the combined NVIDIA Surround display. Right-click → Split to turn Surround off and get the panels back.");
+        if (monitor.ReleasedFromSurround)
+            lines.Add("Comes back as its own display when Surround turns off on Apply.");
         return string.Join(Environment.NewLine, lines);
     }
 
@@ -405,7 +413,141 @@ internal sealed class ArrangeDisplaysForm : Form
             case MonitorCommand.Disable: SetEnabled(monitor, false); break;
             case MonitorCommand.MakePrimary: MakePrimary(monitor); break;
             case MonitorCommand.Delete: DeleteMonitor(monitor); break;
+            case MonitorCommand.CombineSurround: CombineIntoSurround(monitor); break;
+            case MonitorCommand.SplitSurround: SplitSurround(monitor); break;
         }
+    }
+
+    /// <summary>
+    /// Stages an NVIDIA Surround made of the row of matching panels <paramref name="monitor"/>
+    /// sits in, in the left-to-right order shown. The panels fold into one tile at the row's
+    /// spot; nothing changes on screen until Apply.
+    /// </summary>
+    private async void CombineIntoSurround(ArrangedMonitor monitor)
+    {
+        var row = ArrangementModel.SurroundRow(_monitors, monitor);
+        if (row.Count < 2) return;
+        // The grid is built from what NVIDIA reports for each panel right now, so the panels
+        // must be live with no unapplied changes of their own.
+        bool LiveAndUnchanged(ArrangedMonitor panel) =>
+            panel.GdiDeviceName.Length > 0 &&
+            _baseline.TryGetValue(panel.DevicePath, out var live) && live.StartsWith(panel.SettingsKey + "|", StringComparison.Ordinal);
+        if (!row.All(LiveAndUnchanged))
+        {
+            MessageBox.Show(this, "Every panel in the row has to be on, with its resolution and refresh rate applied, before it can join Surround. " +
+                "Apply those changes first, then combine.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        NvidiaSurroundConfig grid;
+        SetBusy(true, "Reading the NVIDIA displays…");
+        try
+        {
+            var names = row.Select(panel => panel.GdiDeviceName).ToList();
+            grid = await Task.Run(() => NvidiaSurroundManager.BuildRowGrid(names));
+        }
+        catch (Exception ex)
+        {
+            SetBusy(false, null);
+            AppLog.Warn($"Could not build a Surround grid: {ex.Message}");
+            MessageBox.Show(this, $"These panels can't be combined into NVIDIA Surround:\n\n{ex.Message}", Text,
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        SetBusy(false, null);
+
+        // Reuse the Surround desktop this app has seen before for these panels, if any; the
+        // apply looks up the live one once the grid is up either way.
+        var knownSurround = _library.Monitors.FirstOrDefault(known =>
+            known.FriendlyName.Equals("NV Surround", StringComparison.OrdinalIgnoreCase) && known.EdidId == row[0].EdidId);
+        var tile = new ArrangedMonitor
+        {
+            DevicePath = knownSurround?.DevicePath ?? $"staged-nv-surround-{row[0].EdidId}",
+            IsSurround = true,
+            Number = _monitors.Count == 0 ? 1 : _monitors.Max(other => other.Number) + 1,
+            Name = "NVIDIA Surround",
+            EdidName = "NV Surround",
+            AdapterName = row[0].AdapterName,
+            Connector = row[0].Connector,
+            Availability = MonitorAvailability.Connected,
+            Enabled = true,
+            Primary = row.Any(panel => panel.Primary),
+            X = row[0].X,
+            Y = row[0].Y,
+            Width = grid.WidthPerDisplay * grid.Columns,
+            Height = grid.HeightPerDisplay * grid.Rows,
+            Rate = row[0].Rate.Clone(),
+            StagedGrid = grid,
+            SurroundMembers = row.Select(panel => panel.DevicePath).ToList(),
+            HasRememberedSpot = true,
+        };
+        foreach (var panel in row)
+        {
+            panel.Enabled = false;
+            panel.Primary = false;
+            panel.MergedIntoSurround = true;
+        }
+        _monitors.Add(tile);
+        ArrangementModel.EnsurePrimary(_monitors);
+        _canvas.SetMonitors(_monitors);
+        _canvas.Selected = tile;
+        OnEdited();
+        UpdateStatus($"Displays {string.Join(", ", row.Select(panel => panel.Number))} will become one NVIDIA Surround display when you Apply");
+    }
+
+    /// <summary>
+    /// For a staged Surround: undoes the combine. For the live one: stages turning Surround off,
+    /// with its panels placed side by side where the Surround display is now, in their usual order.
+    /// </summary>
+    private void SplitSurround(ArrangedMonitor tile)
+    {
+        if (tile.StagedGrid != null)
+        {
+            foreach (var panel in _monitors.Where(panel => tile.SurroundMembers.Contains(panel.DevicePath)))
+            {
+                panel.MergedIntoSurround = false;
+                panel.Enabled = true;
+                panel.Primary = tile.Primary && panel.DevicePath == tile.SurroundMembers[tile.SurroundMembers.Count / 2];
+            }
+            _monitors.Remove(tile);
+            ArrangementModel.EnsurePrimary(_monitors);
+            _canvas.SetMonitors(_monitors);
+            OnEdited();
+            UpdateStatus("Combine undone");
+            return;
+        }
+
+        // The live Surround's panels show as unavailable (Windows cannot see them while the
+        // grid is up); they are the ones with the same EDID as the Surround display.
+        var panels = _monitors
+            .Where(panel => panel.Availability == MonitorAvailability.InSurround && panel.EdidId == tile.EdidId)
+            .OrderBy(panel => panel.Home?.X ?? panel.X)
+            .ToList();
+        if (panels.Count == 0)
+        {
+            MessageBox.Show(this, "The panels behind this Surround display aren't known yet, so they can't be placed. " +
+                "Turn Surround off from a profile once; after that they are remembered.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var x = tile.X;
+        foreach (var panel in panels)
+        {
+            panel.ReleasedFromSurround = true;
+            panel.Enabled = true;
+            panel.Primary = false;
+            panel.X = x;
+            panel.Y = tile.Y;
+            x += panel.DesktopSize.Width;
+        }
+        if (tile.Primary)
+            panels[panels.Count / 2].Primary = true; // the middle panel of a triple, as Windows users expect
+        tile.Enabled = false;
+        tile.Primary = false;
+        ArrangementModel.EnsurePrimary(_monitors);
+        _canvas.SetMonitors(_monitors);
+        OnEdited();
+        UpdateStatus($"NVIDIA Surround will turn off and displays {string.Join(", ", panels.Select(panel => panel.Number))} come back when you Apply");
     }
 
     /// <summary>
@@ -416,6 +558,22 @@ internal sealed class ArrangeDisplaysForm : Form
     private bool SetEnabled(ArrangedMonitor monitor, bool enabled)
     {
         if (monitor.Enabled == enabled) return true;
+        if (!enabled && monitor.StagedGrid != null)
+        {
+            // Turning off a Surround that only exists here means not making it.
+            SplitSurround(monitor);
+            return true;
+        }
+        if (enabled && monitor.IsSurround && monitor.StagedGrid == null)
+        {
+            // Switching the live Surround back on after a staged split: undo the split.
+            foreach (var panel in _monitors.Where(panel => panel.ReleasedFromSurround))
+            {
+                panel.ReleasedFromSurround = false;
+                panel.Enabled = false;
+                panel.Primary = false;
+            }
+        }
         if (enabled && !monitor.CanEnable)
         {
             UpdateStatus($"{monitor.Name} is not connected");

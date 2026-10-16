@@ -76,7 +76,14 @@ internal static class DisplayManager
         };
     }
 
-    public static void ApplyProfile(DisplayProfile profile, NvidiaSurroundConfig? recentlyObservedSurround = null)
+    /// <summary>
+    /// Applies a profile and returns what was actually applied: the profile itself, or a
+    /// re-laid-out copy without the monitors that are not connected. Which monitors are missing
+    /// is decided only AFTER the NVIDIA Surround transition: the panels inside an active Surround
+    /// look unplugged to Windows until it is turned off, and deciding earlier dropped them.
+    /// </summary>
+    public static (DisplayProfile Applied, IReadOnlyList<MonitorInfo> Skipped) ApplyProfile(
+        DisplayProfile profile, NvidiaSurroundConfig? recentlyObservedSurround = null)
     {
         // Surround is created by the NVIDIA driver, below Windows CCD. A newly captured
         // profile carries the exact grid; a legacy "NV Surround" profile can still ask the
@@ -87,7 +94,6 @@ internal static class DisplayManager
             // even one on another adapter (a USB DisplayLink panel), stays connected but is
             // switched off. A profile that saved more than the Surround desktop must therefore
             // restore its Windows layout on top of the grid.
-            var hasOtherMonitors = profile.Monitors.Length > 1;
             var gridAlreadyLive = recentlyObservedSurround != null &&
                 NvidiaSurroundManager.Matches(recentlyObservedSurround, profile.NvidiaSurround);
             if (gridAlreadyLive)
@@ -102,28 +108,83 @@ internal static class DisplayManager
                 NvidiaSurroundManager.Apply(profile.NvidiaSurround);
             }
 
-            if (hasOtherMonitors || gridAlreadyLive)
+            // A grid built in Arrange Displays has no Surround desktop yet, and the driver may
+            // expose an existing grid's desktop under a new path; use the live one.
+            ResolveSurroundDevicePath(profile);
+            var applied = WithoutMissingMonitors(profile, out var skipped);
+            if (applied.Monitors.Length > 1 || gridAlreadyLive)
             {
                 // Never supply a topology without the Surround desktop in it: that would make
                 // the extra monitor the only display. Wait for every saved monitor first.
-                WaitForMonitorsAvailable(profile, TimeSpan.FromSeconds(10));
-                AppLog.Info($"Restoring the Windows layout of '{profile.Name}' around the Surround desktop ({profile.Monitors.Length} monitor(s)).");
-                ApplyWindowsTopology(profile);
+                WaitForMonitorsAvailable(applied, TimeSpan.FromSeconds(10));
+                AppLog.Info($"Restoring the Windows layout of '{applied.Name}' around the Surround desktop ({applied.Monitors.Length} monitor(s)).");
+                ApplyWindowsTopology(applied);
             }
-            return;
+            return (applied, skipped);
         }
         if (profile.IsNvidiaSurround)
         {
             AppLog.Info($"Applying legacy NVIDIA Surround profile '{profile.Name}'.");
             profile.NvidiaSurround = NvidiaSurroundManager.ApplyLegacy(profile);
-            return;
+            return (profile, []);
         }
 
         // CCD cannot split a Surround source into physical monitors. Give the outputs back to
         // Windows first, wait for the driver transition, then restore the saved Windows paths.
         var surroundWasDisabled = NvidiaSurroundManager.DisableIfActive(recentlyObservedSurround);
         AppLog.Info($"Applying Windows display profile '{profile.Name}'. NVIDIA Surround transition required={surroundWasDisabled}.");
-        ApplyWindowsTopology(profile);
+        var resolved = WithoutMissingMonitors(profile, out var missing);
+        ApplyWindowsTopology(resolved);
+        return (resolved, missing);
+    }
+
+    /// <summary>The profile without monitors that are not connected right now (logged), re-laid out.</summary>
+    private static DisplayProfile WithoutMissingMonitors(DisplayProfile profile, out IReadOnlyList<MonitorInfo> skipped)
+    {
+        var applied = DisplayLayout.WithoutMissingMonitors(profile, GetConnectedMonitorDevicePaths(), out skipped);
+        if (skipped.Count > 0)
+            AppLog.Warn($"Not connected, skipped: {string.Join(", ", skipped.Select(Describe))}. Re-laid out the rest: " +
+                string.Join(", ", applied.Monitors.Select(monitor =>
+                    $"{Describe(monitor)} at ({monitor.Position.X},{monitor.Position.Y}){(monitor.IsPrimary ? " primary" : "")}")));
+        return applied;
+
+        static string Describe(MonitorInfo monitor) => monitor.FriendlyName.Length > 0 ? monitor.FriendlyName : monitor.EdidId;
+    }
+
+    /// <summary>
+    /// Points the profile's Surround desktop at the live NV Surround target when its saved path
+    /// is not available (a grid staged in Arrange Displays has none; the driver could also
+    /// renumber it). Waits briefly, since the logical monitor appears just after the grid.
+    /// </summary>
+    private static void ResolveSurroundDevicePath(DisplayProfile profile)
+    {
+        var surround = profile.SurroundMonitor;
+        if (surround == null)
+            return;
+
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        do
+        {
+            var (paths, _) = QueryConfig(QueryDisplayConfigFlags.QDC_ALL_PATHS | QueryDisplayConfigFlags.QDC_VIRTUAL_MODE_AWARE);
+            var live = paths
+                .Where(path => path.targetInfo.targetAvailable != 0)
+                .Select(path => GetTargetDeviceName(path.targetInfo.adapterId, path.targetInfo.id))
+                .Where(name => name.monitorFriendlyDeviceName?.Equals("NV Surround", StringComparison.OrdinalIgnoreCase) == true &&
+                               !string.IsNullOrEmpty(name.monitorDevicePath))
+                .Select(name => name.monitorDevicePath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (live.Contains(surround.DevicePath, StringComparer.OrdinalIgnoreCase))
+                return;
+            if (live.Count > 0)
+            {
+                AppLog.Info($"Surround desktop for '{profile.Name}' is {live[0]} (saved: {(surround.DevicePath.Length > 0 ? surround.DevicePath : "none")}).");
+                surround.DevicePath = live[0];
+                return;
+            }
+            Thread.Sleep(250);
+        } while (elapsed.Elapsed < TimeSpan.FromSeconds(5));
+        AppLog.Warn($"No live NV Surround desktop found for '{profile.Name}' after enabling its grid.");
     }
 
     /// <summary>Wait until every monitor saved in the profile is an available CCD target.

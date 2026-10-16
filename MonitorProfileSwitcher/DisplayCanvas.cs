@@ -9,6 +9,8 @@ internal enum MonitorCommand
     Disable,
     MakePrimary,
     Delete,
+    CombineSurround,
+    SplitSurround,
 }
 
 /// <summary>
@@ -96,7 +98,7 @@ internal sealed class DisplayCanvas : Control
     private List<ArrangedMonitor> InLayout => _monitors.Where(monitor => monitor.InLayout).ToList();
     private List<ArrangedMonitor> EnabledMonitors => _monitors.Where(monitor => monitor.Enabled).ToList();
     /// <summary>Monitors with no place in the layout: Surround panels, and unplugged ones never placed.</summary>
-    private List<ArrangedMonitor> InStrip => _monitors.Where(monitor => !monitor.InLayout).ToList();
+    private List<ArrangedMonitor> InStrip => _monitors.Where(monitor => !monitor.InLayout && !monitor.MergedIntoSurround).ToList();
 
     private void UpdateTransform()
     {
@@ -211,16 +213,22 @@ internal sealed class DisplayCanvas : Control
             (monitor.Number.ToString(), numberFont, text),
             (monitor.Name, nameFont, text),
         };
+        // State lines first: on a short tile they matter more than the details below them.
+        var surroundGreen = Color.FromArgb(118, 185, 0);
         if (unplugged)
             lines.Add(("Not connected — keeps this spot", Font, Muted));
         else if (!on)
             lines.Add(("Off — right-click to enable", Font, Color.FromArgb(255, 214, 102)));
+        if (monitor.StagedGrid != null)
+            lines.Add(($"New NVIDIA Surround 1x{monitor.StagedGrid.Columns} — turns on when you Apply", Font, surroundGreen));
+        else if (monitor.IsSurround)
+            lines.Add(("NVIDIA Surround", Font, surroundGreen));
+        if (monitor.ReleasedFromSurround && on)
+            lines.Add(("Leaves Surround when you Apply", Font, surroundGreen));
         lines.Add((DetectedLine(monitor), Font, detail));
         lines.Add(($"{monitor.DesktopSize.Width}×{monitor.DesktopSize.Height} · {monitor.RateText}", Font, detail));
         if (monitor.Primary)
             lines.Add(("★ Main display", Font, Color.FromArgb(255, 214, 102)));
-        if (monitor.IsSurround)
-            lines.Add(("NVIDIA Surround", Font, Color.FromArgb(118, 185, 0)));
 
         var y = bounds.Top;
         foreach (var (line, font, color) in lines)
@@ -411,6 +419,17 @@ internal sealed class DisplayCanvas : Control
             case MonitorAvailability.Connected when monitor.Enabled:
                 Add("Disable monitor", MonitorCommand.Disable);
                 Add("Make main display", MonitorCommand.MakePrimary, enabled: !monitor.Primary);
+                if (monitor.IsSurround)
+                {
+                    menu.Items.Add(new ToolStripSeparator());
+                    Add(monitor.StagedGrid != null ? "Undo combine (back to separate panels)" : "Split NVIDIA Surround into separate displays",
+                        MonitorCommand.SplitSurround);
+                }
+                else if (ArrangementModel.SurroundRow(_monitors, monitor) is { Count: >= 2 } row)
+                {
+                    menu.Items.Add(new ToolStripSeparator());
+                    Add($"Combine row into NVIDIA Surround ({row.Count} panels)", MonitorCommand.CombineSurround);
+                }
                 break;
             case MonitorAvailability.Connected:
                 Add("Enable monitor", MonitorCommand.Enable, bold: true);
